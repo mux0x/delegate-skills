@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {
   AGY_EFFORT,
   ALL_DIALS,
+  PATH_DIALS,
   CLAUDE_EFFORT,
   MUSE_EFFORT,
   COPILOT_EFFORT,
@@ -149,7 +150,7 @@ function validateLane(name, lane, label) {
     if (!impl.supports.includes(field)) {
       return `${label}: lane ${name}: ${impl.key} does not support ${field} (supports: ${impl.supports.join(", ") || "none"})`;
     }
-    if (field === "readOnly" || field === "force") {
+    if (field === "readOnly" || field === "force" || field === "ignoreUserConfig") {
       if (typeof lane[field] !== "boolean") {
         return `${label}: lane ${name}.${field} must be a boolean`;
       }
@@ -157,6 +158,14 @@ function validateLane(name, lane, label) {
     }
     if (typeof lane[field] !== "string" || lane[field].length === 0) {
       return `${label}: lane ${name}.${field} must be a non-empty string`;
+    }
+    if (PATH_DIALS.includes(field)) {
+      if (!isAbsolute(lane[field])) return `${label}: lane ${name}.${field} must be an absolute path`;
+      continue;
+    }
+    if (field === "worker") {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(lane[field])) return `${label}: lane ${name}.worker has unsupported characters`;
+      continue;
     }
     const valueError = validateDialValue(impl.key, field, lane[field], name, label);
     if (valueError) return valueError;

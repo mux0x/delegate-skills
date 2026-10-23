@@ -62,7 +62,7 @@ export const IMPLEMENTERS = Object.freeze([
       entry: "file",
       match: /\.jsonl$/,
     },
-    supports: ["model", "effort", "timeout", "readOnly"],
+    supports: ["model", "effort", "timeout", "readOnly", "worker", "configDir", "claudeBin"],
     winShell: true,
   },
   {
@@ -107,7 +107,7 @@ export const IMPLEMENTERS = Object.freeze([
       entry: "file",
       match: /^rollout-.*\.jsonl$/,
     },
-    supports: ["model", "effort", "sandbox", "timeout", "readOnly"],
+    supports: ["model", "effort", "sandbox", "timeout", "readOnly", "worker", "codexHome", "codexBin", "ignoreUserConfig"],
     winShell: true,
   },
   {
@@ -467,4 +467,12 @@ export const ALL_DIALS = Object.freeze([
   "permissionMode",
   "force",
   "provider",
+  "worker",
+  "configDir",
+  "claudeBin",
+  "codexHome",
+  "codexBin",
+  "ignoreUserConfig",
 ]);
+// Factory worker-profile dials: absolute paths to an official CLI and its profile directory.
+export const PATH_DIALS = Object.freeze(["configDir", "claudeBin", "codexHome", "codexBin"]);

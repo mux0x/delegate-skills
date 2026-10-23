@@ -73,6 +73,20 @@
  *                                     Mutually exclusive with --read-only.
  *   -h, --help                        Show this help.
  *
+ * Factory extensions (opt-in; omitted flags leave upstream behavior unchanged):
+ *   --worker <id>                     Worker-profile label recorded in result.json.
+ *   --claude-bin <abs path>           Launch this executable instead of `claude` on PATH.
+ *   --config-dir <abs dir>            Child CLAUDE_CONFIG_DIR (selects the official profile).
+ *   --implement                       Factory implementation mode: enables skills (Skill and Agent
+ *                                     tools, no --disable-slash-commands), loads only
+ *                                     project/local settings, and lets the run commit on
+ *                                     the current branch. Push, gh, and nested claude stay
+ *                                     denied; the Factory git guard verifies refs after.
+ *   --plugin-dir <dir>                Session-only skill plugin (repeatable, implement only).
+ *   --mcp-config <file>               Strict MCP config for this run (replaces mcp__* deny).
+ *   --allow-mcp-tool <mcp__s__t>      Pre-approve one MCP tool (repeatable); every other
+ *                                     MCP tool needs a permission print mode cannot grant.
+ *
  * Claude is always launched with:
  *   -p --output-format stream-json --verbose
  * The brief is sent through stdin, never argv. `--bg` and `--bare` are not used.
@@ -117,7 +131,7 @@ import {
   closeSync,
   realpathSync,
 } from "node:fs";
-import {basename, delimiter, join, relative, resolve, dirname } from "node:path";
+import {basename, delimiter, isAbsolute, join, relative, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { constants as osConstants, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
@@ -131,6 +145,7 @@ const MAX_TIMER_MS = 2_147_483_647;
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max", "ultracode"]);
 const SAFE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:@\/\[\]-]*$/;
 const SAFE_SESSION = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const SAFE_MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
 
 const IMPLEMENTER_KEY = "claude";
 
@@ -276,6 +291,13 @@ function parseArgs(argv) {
     session: null,
     readOnly: false,
     dangerouslySkipPermissions: false,
+    worker: null,
+    claudeBin: null,
+    configDir: null,
+    implement: false,
+    pluginDirs: [],
+    mcpConfig: null,
+    allowMcpTools: [],
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -310,6 +332,13 @@ function parseArgs(argv) {
         opts.dangerouslySkipPermissions = true;
         flagged.add("dangerouslySkipPermissions");
         break;
+      case "--worker": opts.worker = next(); break;
+      case "--claude-bin": opts.claudeBin = next(); break;
+      case "--config-dir": opts.configDir = next(); break;
+      case "--implement": opts.implement = true; flagged.add("readOnly"); break;
+      case "--plugin-dir": opts.pluginDirs.push(resolve(next())); break;
+      case "--mcp-config": opts.mcpConfig = resolve(next()); break;
+      case "--allow-mcp-tool": opts.allowMcpTools.push(next()); break;
       default:
         fail(`unknown option: ${arg}`);
     }
@@ -354,6 +383,7 @@ function parseArgs(argv) {
   } catch {
     fail(`--cd directory not found: ${opts.cd}`);
   }
+  validateFactoryOptions(opts);
   if (opts.outDir && existsSync(opts.outDir)) {
     try {
       if (!statSync(opts.outDir).isDirectory()) fail(`--out-dir is not a directory: ${opts.outDir}`);
@@ -362,6 +392,50 @@ function parseArgs(argv) {
     }
   }
   return opts;
+}
+
+function validateFactoryOptions(opts) {
+  if (opts.worker !== null && !SAFE_SESSION.test(opts.worker)) {
+    fail("--worker contains unsupported characters (allowed: letters, digits, . _ : -)");
+  }
+  if (opts.implement && (opts.readOnly || opts.dangerouslySkipPermissions)) {
+    fail("--implement cannot be combined with --read-only or --dangerously-skip-permissions");
+  }
+  if (opts.pluginDirs.length && !opts.implement) fail("--plugin-dir requires --implement");
+  if (opts.claudeBin !== null) {
+    if (!isAbsolute(opts.claudeBin)) fail("--claude-bin must be an absolute path");
+    try {
+      if (!statSync(opts.claudeBin).isFile()) fail(`--claude-bin is not a file: ${opts.claudeBin}`);
+      if (process.platform !== "win32") accessSync(opts.claudeBin, fsConstants.X_OK);
+    } catch {
+      fail(`--claude-bin is missing or not executable: ${opts.claudeBin}`);
+    }
+  }
+  if (opts.configDir !== null) {
+    if (!isAbsolute(opts.configDir)) fail("--config-dir must be an absolute path");
+    try {
+      if (!statSync(opts.configDir).isDirectory()) fail(`--config-dir is not a directory: ${opts.configDir}`);
+    } catch {
+      fail(`--config-dir directory not found: ${opts.configDir}`);
+    }
+  }
+  for (const dir of opts.pluginDirs) {
+    try {
+      if (!statSync(dir).isDirectory()) fail(`--plugin-dir is not a directory: ${dir}`);
+    } catch {
+      fail(`--plugin-dir directory not found: ${dir}`);
+    }
+  }
+  if (opts.mcpConfig !== null) {
+    try {
+      JSON.parse(readFileSync(opts.mcpConfig, "utf8"));
+    } catch {
+      fail(`--mcp-config is missing or not valid JSON: ${opts.mcpConfig}`);
+    }
+  }
+  if (opts.allowMcpTools.length && opts.mcpConfig === null) fail("--allow-mcp-tool requires --mcp-config");
+  const badTool = opts.allowMcpTools.find((tool) => !SAFE_MCP_TOOL.test(tool));
+  if (badTool !== undefined) fail(`--allow-mcp-tool "${badTool}" must name one tool as mcp__<server>__<tool>`);
 }
 
 function headerComment() {
@@ -390,8 +464,9 @@ function readBrief(opts) {
   }
 }
 
-function childEnvironment() {
+function childEnvironment(opts) {
   const env = { ...process.env };
+  if (opts.configDir !== null) env.CLAUDE_CONFIG_DIR = opts.configDir;
   if (process.platform === "win32") {
     for (const key of Object.keys(env)) {
       if (key.toUpperCase() === "CLAUDECODE") delete env[key];
@@ -409,7 +484,10 @@ function environmentValue(env, name) {
   return key ? env[key] : undefined;
 }
 
-function resolveClaudeLauncher(env, cwd) {
+function resolveClaudeLauncher(env, cwd, claudeBin = null) {
+  if (claudeBin !== null) {
+    return { path: claudeBin, kind: /\.(cmd|bat)$/i.test(claudeBin) ? "cmd" : "direct" };
+  }
   const pathValue = environmentValue(env, "PATH");
   if (!pathValue) return null;
   const pathEntries = pathValue.split(delimiter).map((entry) => entry.replace(/^"(.*)"$/, "$1"));
@@ -505,6 +583,7 @@ function selectedPermissionMode(opts) {
 
 function toolSurface(opts) {
   if (opts.readOnly) return "Read,Glob,Grep";
+  if (opts.implement) return `Read,Glob,Grep,Edit,Write,${shellTool()},Skill,Agent`;
   return `Read,Glob,Grep,Edit,Write,${shellTool()}`;
 }
 
@@ -519,7 +598,18 @@ function profileSettings(opts) {
     permissions: {
       deny: opts.readOnly
         ? []
-        : [
+        : opts.implement
+          ? [
+              // Implement mode lets Matt's /implement commit on the Factory-created
+              // branch. Remote and forge side effects stay with the Factory.
+              `${shell}(git push *)`,
+              `${shell}(git * push *)`,
+              `${shell}(git * push)`,
+              `${shell}(gh *)`,
+              `${shell}(claude *)`,
+              `${shell}(*claude-delegate*)`,
+            ]
+          : [
             // Two-wildcard git forms require text after the subcommand, so the
             // single-wildcard forms also catch `git -C <dir> push`; they also
             // deny reads like `git log --grep push`. Anchor `claude` at command
@@ -587,10 +677,17 @@ function buildArgv(opts, run) {
     "--verbose",
     "--tools", toolSurface(opts),
     "--strict-mcp-config",
-    "--disallowedTools", "mcp__*",
-    "--disable-slash-commands",
-    "--settings", run.settingsPath,
   ];
+  if (opts.mcpConfig !== null) argv.push("--mcp-config", opts.mcpConfig);
+  else argv.push("--disallowedTools", "mcp__*");
+  if (opts.implement) {
+    argv.push("--setting-sources", "project,local");
+    for (const dir of opts.pluginDirs) argv.push("--plugin-dir", dir);
+  } else {
+    argv.push("--disable-slash-commands");
+  }
+  argv.push("--settings", run.settingsPath);
+  if (opts.allowMcpTools.length) argv.push("--allowedTools", ...opts.allowMcpTools);
 
   if (opts.readOnly) {
     argv.push("--permission-mode", "plan");
@@ -633,6 +730,18 @@ function handleEvent(event, state, run) {
   if (event.type === "system" && event.subtype === "init") {
     const mode = event.permissionMode ?? event.permission_mode;
     if (typeof mode === "string" && mode) state.permissionMode = mode;
+    if (Array.isArray(event.mcp_servers)) state.mcpServers = event.mcp_servers;
+  }
+  if (event.type === "rate_limit_event" && event.rate_limit_info && typeof event.rate_limit_info === "object") {
+    state.rateLimit = { observedAt: new Date().toISOString(), ...event.rate_limit_info };
+  }
+  if (event.type === "assistant" && event.message && Array.isArray(event.message.content)) {
+    for (const part of event.message.content) {
+      if (part && part.type === "tool_use" && typeof part.name === "string") {
+        if (part.name === "Skill" && part.input && typeof part.input.skill === "string") state.skillCalls.push(part.input.skill);
+        if (part.name.startsWith("mcp__")) state.mcpCalls.push(part.name);
+      }
+    }
   }
 
   if (event.type !== "result") return;
@@ -648,6 +757,9 @@ function handleEvent(event, state, run) {
   state.totalCostUsd = typeof cost === "number" && Number.isFinite(cost) ? cost : null;
   const turns = event.num_turns ?? event.numTurns;
   state.numTurns = typeof turns === "number" && Number.isFinite(turns) ? turns : null;
+  if (Array.isArray(event.permission_denials)) {
+    state.permissionDenials = event.permission_denials.map((denial) => denial && denial.tool_name).filter(Boolean);
+  }
   writeFileSync(run.finalPath, state.finalMessage, "utf8");
 }
 
@@ -930,6 +1042,31 @@ function stderrTail(stderrPath) {
   }
 }
 
+// Native skill evidence lives in Claude's own session transcript, not the print stream: a
+// user-invoked skill appears as <command-name>, every loaded skill as its base directory.
+function skillTrace(opts, sessionId) {
+  if (!sessionId || !SAFE_SESSION.test(sessionId)) return null;
+  const root = join(opts.configDir ?? environmentValue(process.env, "CLAUDE_CONFIG_DIR") ?? join(process.env.HOME || "", ".claude"), "projects");
+  let transcript = null;
+  try {
+    for (const project of readdirSync(root)) {
+      const candidate = join(root, project, `${sessionId}.jsonl`);
+      if (existsSync(candidate)) { transcript = candidate; break; }
+    }
+  } catch {
+    return null;
+  }
+  if (transcript === null) return null;
+  let text;
+  try { text = readFileSync(transcript, "utf8"); } catch { return null; }
+  const unique = (pattern) => [...new Set([...text.matchAll(pattern)].map((match) => match[1]))];
+  return {
+    transcript,
+    commands: unique(/<command-name>([^<]+)<\/command-name>/g),
+    skillDirs: unique(/Base directory for this skill: ([^\\"\n]+)/g),
+  };
+}
+
 function writeJsonAtomic(path, value) {
   const temporary = `${path}.tmp-${process.pid}`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
@@ -974,8 +1111,23 @@ function makeResultWriter(opts, version, run, state, beforeTree, beforeFingerpri
       finalPath: run.finalPath,
       stderrPath: run.stderrPath,
       settingsPath: run.settingsPath,
+      ...(opts.worker === null ? {} : { worker: opts.worker }),
+      ...(opts.claudeBin === null ? {} : { claudeBin: opts.claudeBin }),
+      ...(opts.configDir === null ? {} : { configDir: opts.configDir }),
+      ...(opts.implement ? { mode: "implement", pluginDirs: opts.pluginDirs, skillCalls: state.skillCalls } : {}),
+      ...(opts.mcpConfig === null ? {} : {
+        mcpConfig: opts.mcpConfig,
+        allowedMcpTools: opts.allowMcpTools,
+        mcpServers: state.mcpServers,
+        mcpCalls: state.mcpCalls,
+      }),
+      ...(state.permissionDenials.length ? { permissionDenials: state.permissionDenials } : {}),
+      ...(state.rateLimit ? { rateLimit: state.rateLimit } : {}),
       ...extra,
     };
+    if (opts.implement && extra.status !== undefined && extra.status !== "claude_unavailable") {
+      result.skillTrace = skillTrace(opts, state.sessionId);
+    }
     if (opts.readOnly) {
       result.readOnlyViolation = readOnlyVerdict(
         beforeTree,
@@ -1244,7 +1396,9 @@ function printSummary(result, resultPath) {
   lines.push("--- end report ---");
   lines.push("");
   lines.push(`result: ${resultPath}`);
-  lines.push("relay does not commit. Review the diff, re-run the project gates yourself, then land it from the orchestrator.");
+  lines.push(result.mode === "implement"
+    ? "implement mode: the run may have committed on the current branch. Verify refs with the Factory git guard before pushing."
+    : "relay does not commit. Review the diff, re-run the project gates yourself, then land it from the orchestrator.");
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
@@ -1257,8 +1411,8 @@ function main() {
     fail(`brief is ${Math.ceil(briefBytes / 1_000_000)}MB; Claude Code caps piped stdin at 10MB. Put large context in the workspace and reference it from a smaller brief.`);
   }
 
-  const env = childEnvironment();
-  const launcher = resolveClaudeLauncher(env, opts.cd);
+  const env = childEnvironment(opts);
+  const launcher = resolveClaudeLauncher(env, opts.cd, opts.claudeBin);
   let run;
   try {
     run = prepareRun(opts, brief);
@@ -1283,6 +1437,11 @@ function main() {
     numTurns: null,
     usage: null,
     totalCostUsd: null,
+    skillCalls: [],
+    mcpCalls: [],
+    mcpServers: null,
+    permissionDenials: [],
+    rateLimit: null,
   };
   const writeResult = makeResultWriter(opts, version, run, state, beforeTree, beforeFingerprints);
 

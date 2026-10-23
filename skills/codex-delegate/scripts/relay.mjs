@@ -76,6 +76,19 @@
  *                           the system temp dir, so the repo under review stays clean).
  *   -h, --help              Show this help.
  *
+ * Factory extensions (opt-in; omitted flags leave upstream behavior unchanged):
+ *   --worker <id>           Worker-profile label recorded in result.json.
+ *   --codex-bin <abs path>  Launch this executable instead of `codex` on PATH.
+ *   --codex-home <abs dir>  Child CODEX_HOME (selects the official profile).
+ *   --implement             Factory implementation mode: workspace-write sandbox plus the
+ *                           repository's git common dir as a writable root, so Matt's
+ *                           $implement can commit. Network stays off; the Factory git
+ *                           guard verifies refs, config, and hooks after the run.
+ *   --mcp-config <file>     JSON {"servers":{"<name>":{"command","args","enabledTools"}}};
+ *                           each server is passed as -c mcp_servers.<name>.* with only its
+ *                           enabledTools exposed. Implies --ignore-user-config so ambient
+ *                           servers from config.toml never start.
+ *
  * Result: written to <out-dir>/result.json and summarized on stdout —
  *   status, exitCode, signal, codexVersion, threadId (for a later resume), finalMessage
  *   (Codex's own report), touchedFiles (git porcelain, null if git can't report), stderrTail on a
@@ -106,7 +119,8 @@
 
 import {spawn, execSync, execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync, appendFileSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
-import {join, resolve, basename, dirname } from "node:path";
+import {join, resolve, basename, dirname, isAbsolute } from "node:path";
+import { accessSync, constants as fsConstants, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { constants, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
@@ -125,6 +139,7 @@ const SAFE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const BARE_TOKEN = /^[a-z][a-z0-9-]*$/i;
 
 const IMPLEMENTER_KEY = "codex";
+const SAFE_MCP_NAME = /^[A-Za-z0-9_-]+$/;
 
 function applyFleetLane(opts, flagged) {
   if (!opts.lane) return;
@@ -191,6 +206,13 @@ function parseArgs(argv) {
     skipGitRepoCheck: false,
     timeout: null,
     outDir: null,
+    worker: null,
+    codexBin: null,
+    codexHome: null,
+    implement: false,
+    mcpConfig: null,
+    mcpServers: null,
+    gitWritableRoot: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -225,6 +247,11 @@ function parseArgs(argv) {
       case "--skip-git-repo-check": opts.skipGitRepoCheck = true; break;
       case "--timeout": opts.timeout = next(); flagged.add("timeout"); break;
       case "--out-dir": opts.outDir = resolve(next()); break;
+      case "--worker": opts.worker = next(); break;
+      case "--codex-bin": opts.codexBin = next(); break;
+      case "--codex-home": opts.codexHome = next(); break;
+      case "--implement": opts.implement = true; flagged.add("sandbox"); flagged.add("readOnly"); break;
+      case "--mcp-config": opts.mcpConfig = resolve(next()); break;
       default:
         fail(`unknown option: ${arg}`);
     }
@@ -282,7 +309,69 @@ function parseArgs(argv) {
   if (opts.session !== null && !SAFE_SESSION.test(opts.session)) {
     fail("--session must be a shell-safe thread id (letters, digits, . _ : -)");
   }
+  validateFactoryOptions(opts);
   return opts;
+}
+
+function validateFactoryOptions(opts) {
+  if (opts.worker !== null && !SAFE_SESSION.test(opts.worker)) {
+    fail("--worker contains unsupported characters (allowed: letters, digits, . _ : -)");
+  }
+  if (opts.codexBin !== null) {
+    if (!isAbsolute(opts.codexBin)) fail("--codex-bin must be an absolute path");
+    try {
+      if (!statSync(opts.codexBin).isFile()) fail(`--codex-bin is not a file: ${opts.codexBin}`);
+      if (process.platform !== "win32") accessSync(opts.codexBin, fsConstants.X_OK);
+    } catch {
+      fail(`--codex-bin is missing or not executable: ${opts.codexBin}`);
+    }
+  }
+  if (opts.codexHome !== null) {
+    if (!isAbsolute(opts.codexHome)) fail("--codex-home must be an absolute path");
+    try {
+      if (!statSync(opts.codexHome).isDirectory()) fail(`--codex-home is not a directory: ${opts.codexHome}`);
+    } catch {
+      fail(`--codex-home directory not found: ${opts.codexHome}`);
+    }
+  }
+  if (opts.implement) {
+    if (opts.sandbox !== "workspace-write") fail("--implement runs in the workspace-write sandbox; drop --sandbox/--read-only");
+    if (opts.networkAccess) fail("--implement keeps the sandbox offline; drop --network-access");
+    try {
+      const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+        cwd: opts.cd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (!common) throw new Error("empty");
+      opts.gitWritableRoot = common;
+      opts.sandboxConfigured = true;
+    } catch {
+      fail("--implement requires --cd inside a git repository");
+    }
+  }
+  if (opts.mcpConfig !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(opts.mcpConfig, "utf8"));
+    } catch {
+      fail(`--mcp-config is missing or not valid JSON: ${opts.mcpConfig}`);
+    }
+    const servers = parsed && typeof parsed.servers === "object" && parsed.servers ? parsed.servers : null;
+    if (!servers || !Object.keys(servers).length) fail("--mcp-config needs a non-empty \"servers\" object");
+    for (const [name, server] of Object.entries(servers)) {
+      if (!SAFE_MCP_NAME.test(name)) fail(`--mcp-config server name "${name}" must use letters, digits, _ or -`);
+      if (!server || typeof server.command !== "string" || !isAbsolute(server.command)) {
+        fail(`--mcp-config server "${name}" needs an absolute "command"`);
+      }
+      if (server.args !== undefined && !(Array.isArray(server.args) && server.args.every((arg) => typeof arg === "string"))) {
+        fail(`--mcp-config server "${name}" "args" must be an array of strings`);
+      }
+      if (!Array.isArray(server.enabledTools) || !server.enabledTools.every((tool) => typeof tool === "string" && SAFE_MCP_NAME.test(tool))) {
+        fail(`--mcp-config server "${name}" needs an "enabledTools" allowlist of tool names`);
+      }
+    }
+    opts.mcpServers = servers;
+    opts.ignoreUserConfig = true;
+  }
 }
 
 function parseDuration(duration) {
@@ -361,6 +450,7 @@ function versionProbeTimeout(opts) {
 
 function codexEnv(opts) {
   const env = opts.cleanEnv ? cleanEnvironment(opts) : { ...process.env };
+  if (opts.codexHome !== null) env.CODEX_HOME = opts.codexHome;
   if (process.platform === "win32" && opts.sandbox !== "danger-full-access") removeWindowsAppsFromPath(env);
   return env;
 }
@@ -385,7 +475,7 @@ function removeWindowsAppsFromPath(env) {
   }
 }
 
-function codexVersion(probeTimeoutMs, env) {
+function codexVersion(probeTimeoutMs, env, bin = "codex") {
   try {
     // On Windows, npm installs `codex` as a .cmd shim; Node's CreateProcess only
     // auto-appends .exe, never .cmd, so launching it needs shell:true there or it
@@ -399,8 +489,8 @@ function codexVersion(probeTimeoutMs, env) {
       env,
     };
     const version = (process.platform === "win32"
-      ? execSync("codex --version", options)
-      : execFileSync("codex", ["--version"], options)).trim();
+      ? execSync(`${bin === "codex" ? "codex" : `"${bin}"`} --version`, options)
+      : execFileSync(bin, ["--version"], options)).trim();
     return { version: version || "unknown", error: null };
   } catch (error) {
     if (error?.code === "ENOENT") return { version: null, error: null };
@@ -445,6 +535,8 @@ function buildArgv(opts, finalPath) {
   // Codex accepts shared exec options before the resume subcommand. Reapply only
   // an explicitly selected sandbox; otherwise leave the active Codex config alone.
   if (resuming && opts.sandboxConfigured) argv.push("-s", opts.sandbox);
+  // `codex exec resume` rejects --add-dir, so the writable git root rides on exec itself.
+  if (opts.gitWritableRoot !== null) argv.push("--add-dir", opts.gitWritableRoot);
   if (opts.session) argv.push("resume", opts.session);
   else if (opts.resumeLast) argv.push("resume", "--last");
   // ponytail: shell:true on win32 (needed for the codex.cmd shim) doesn't quote
@@ -466,6 +558,14 @@ function buildArgv(opts, finalPath) {
   if (opts.webSearch !== null) argv.push("-c", `web_search=${opts.webSearch}`);
   if (opts.networkAccess) argv.push("-c", "sandbox_workspace_write.network_access=true");
   if (opts.skipGitRepoCheck) argv.push("--skip-git-repo-check");
+  for (const [name, server] of Object.entries(opts.mcpServers || {})) {
+    argv.push("-c", `mcp_servers.${name}.command=${JSON.stringify(server.command)}`);
+    argv.push("-c", `mcp_servers.${name}.args=${JSON.stringify(server.args || [])}`);
+    argv.push("-c", `mcp_servers.${name}.enabled_tools=${JSON.stringify(server.enabledTools)}`);
+    // exec mode has no approval prompt, so a listed tool is pre-approved individually; tools
+    // outside enabledTools are never exposed to the model at all.
+    for (const tool of server.enabledTools) argv.push("-c", `mcp_servers.${name}.tools.${tool}.approval_mode="approve"`);
+  }
   argv.push("-"); // read the prompt from stdin
   return argv;
 }
@@ -541,8 +641,14 @@ function makeResultWriter(opts, version, run) {
       eventsPath: run.eventsPath,
       finalPath: existsSync(run.finalPath) ? run.finalPath : null,
       stderrPath: run.stderrPath,
+      ...(opts.worker === null ? {} : { worker: opts.worker }),
+      ...(opts.codexBin === null ? {} : { codexBin: opts.codexBin }),
+      ...(opts.codexHome === null ? {} : { codexHome: opts.codexHome }),
+      ...(opts.implement ? { mode: "implement", gitWritableRoot: opts.gitWritableRoot } : {}),
+      ...(opts.mcpServers === null ? {} : { mcpServers: Object.fromEntries(Object.entries(opts.mcpServers).map(([name, server]) => [name, server.enabledTools])) }),
       ...extra,
     };
+    if (extra.threadId && (opts.implement || opts.worker !== null)) Object.assign(result, rolloutTrace(opts, extra.threadId));
     // Publish atomically so a polling orchestrator never reads a half-written file
     // (same idiom as claude-delegate's writeJsonAtomic and qoder-delegate).
     const temporary = `${run.resultPath}.${process.pid}.tmp`;
@@ -550,6 +656,41 @@ function makeResultWriter(opts, version, run) {
     renameSync(temporary, run.resultPath);
     return result;
   };
+}
+
+// Codex records each explicitly invoked skill in its rollout as <skill><name>…</name><path>…</path>
+// and the account's rate-limit windows on every token_count event. Both are read, never written.
+function rolloutTrace(opts, threadId) {
+  if (!SAFE_SESSION.test(threadId)) return {};
+  const sessions = join(opts.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME || "", ".codex"), "sessions");
+  const find = (dir, depth) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isFile() && entry.name.endsWith(`${threadId}.jsonl`)) return path;
+      if (entry.isDirectory() && depth > 0) {
+        const hit = find(path, depth - 1);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+  const rollout = find(sessions, 3);
+  if (rollout === null) return { skillTrace: null };
+  let text;
+  try { text = readFileSync(rollout, "utf8"); } catch { return { skillTrace: null }; }
+  const skills = [...new Map([...text.matchAll(/<skill>\\n<name>([^<]+)<\/name>\\n<path>([^<]+)<\/path>/g)]
+    .map((match) => [match[2], { name: match[1], path: match[2] }])).values()];
+  let rateLimits = null;
+  for (const line of text.split("\n")) {
+    if (!line.includes('"rate_limits"')) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event.payload && event.payload.type === "token_count" && event.payload.rate_limits) rateLimits = event.payload.rate_limits;
+    } catch { /* partial line */ }
+  }
+  return { skillTrace: { rollout, skills }, ...(rateLimits ? { rateLimits } : {}) };
 }
 
 function reportUnavailable(writeResult, resultPath) {
@@ -628,7 +769,7 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
   // sandbox enums, model names (including subagents), pattern-checked efforts
   // and web search modes, the fixed network override, and file paths.
   // detached on POSIX: the child leads a new process group so killChild can fell the whole tree
-  const child = spawnShellLaunch("codex", argv, { cwd: opts.cd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env }, process.platform === "win32");
+  const child = spawnShellLaunch(opts.codexBin === null ? "codex" : process.platform === "win32" ? `"${opts.codexBin}"` : opts.codexBin, argv, { cwd: opts.cd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env }, process.platform === "win32");
 
   let threadId = null;
   let stdoutBuf = "";
@@ -785,7 +926,7 @@ function main() {
   const run = prepareRunDir(opts, brief);
   const probeTimeoutMs = versionProbeTimeout(opts);
   const env = codexEnv(opts);
-  const probe = codexVersion(probeTimeoutMs, env);
+  const probe = codexVersion(probeTimeoutMs, env, opts.codexBin ?? "codex");
   const writeResult = makeResultWriter(opts, probe.version, run);
 
   if (!probe.version && !probe.error) {
@@ -827,7 +968,9 @@ function printSummary(result, resultPath) {
   lines.push("--- end report ---");
   lines.push("");
   lines.push(`result: ${resultPath}`);
-  lines.push("relay does not commit. Review the diff, re-run the project gates yourself, then commit from the orchestrator.");
+  lines.push(result.mode === "implement"
+    ? "implement mode: the run may have committed on the current branch. Verify refs with the Factory git guard before pushing."
+    : "relay does not commit. Review the diff, re-run the project gates yourself, then commit from the orchestrator.");
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
