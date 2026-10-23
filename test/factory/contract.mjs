@@ -11,6 +11,10 @@ import { loadProfiles, resolveWorker, workerEnv } from "../../factory/profiles.m
 import { snapshot, verify } from "../../factory/git-guard.mjs";
 import { codexWindows, fromRelayResult, gate, parseClaudeUsage } from "../../factory/capacity.mjs";
 import { runTicket } from "../../factory/harness.mjs";
+import { brokerCommit, commitMessage } from "../../factory/git-broker.mjs";
+import { dockerArgs, runTestsIsolated } from "../../factory/test-runner.mjs";
+import { checkSnapshot, prepareSnapshot } from "../../factory/review.mjs";
+import { skillOverrides } from "../../factory/skills.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, "..", "..");
@@ -58,7 +62,10 @@ const profilesDoc = {
     "claude-b": { provider: "claude", bin: join(binDir, "claude-b"), configDir: join(scratch, "profiles", "claude-b"), model: "opus", effort: "low", modes: ["review", "implement"], mcp: { config: join(conf, "mcp-claude.json"), allowTools: ["mcp__mock__echo"] }, timeout: "60s" },
     codex: { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), model: "gpt-fake", effort: "medium", modes: ["implement", "review"], mcp: { config: join(conf, "mcp-codex.json") }, timeout: "60s" },
     "review-only": { provider: "claude", bin: join(binDir, "claude-a"), modes: ["review"], timeout: "60s" },
-    hanger: { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement"], timeout: "2s" },
+    "codex-hanger": { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), model: "gpt-fake", modes: ["implement"], timeout: "3s" },
+    hanger: { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement"], pluginDirs: [join(scratch, "plugins", "matt")], timeout: "3s" },
+    "codex-skilled": { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), skillsHome: join(scratch, "plugins", "matt"), model: "gpt-fake", modes: ["implement"], timeout: "60s" },
+    "claude-denyread": { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement", "review"], denyRead: [join(scratch, "private")], timeout: "60s" },
   },
 };
 const profilesPath = join(conf, "workers.json");
@@ -175,7 +182,11 @@ const groups = {
     const settings = (await run("claude-a", "implement", repo, { FAKE_MODE: "implement-nocommit" })).result;
     const profile = JSON.parse(readFileSync(settings.settingsPath, "utf8"));
     const deny = profile.permissions.deny.join(" ");
-    check("7 implement profile allows commit but denies push, gh and nested claude", !deny.includes("commit") && deny.includes("git push") && deny.includes("gh *") && deny.includes("claude *"));
+    check("7 implement profile denies commit, push, gh and nested claude", deny.includes("git commit") && deny.includes("git push") && deny.includes("gh *") && deny.includes("claude *"));
+    const gitDir = join(realpathSync(repo), ".git");
+    check("7 implement mode write-protects .git and .claude for Edit/Write", deny.includes(`Edit(/${gitDir}/**)`) && deny.includes(`Write(/${gitDir}/**)`) && deny.includes(`Edit(/${join(realpathSync(repo), ".claude")}/**)`), deny);
+    check("7 implement mode write-protects .git in the shell sandbox", JSON.stringify(profile.sandbox?.filesystem?.denyWrite ?? []).includes(gitDir), JSON.stringify(profile.sandbox?.filesystem));
+    check("7 result records the protected paths", settings.protectedPaths?.includes(gitDir));
     const review = (await run("claude-a", "review", repo)).result;
     check("7 sandbox stays strict in implement mode", settings.shellSandbox === "strict" && profile.sandbox?.allowUnsandboxedCommands === false);
     check("7 review runs keep plan mode", review.permissionMode === "plan");
@@ -200,7 +211,7 @@ const groups = {
     }
     const { repo: cr } = freshRepo("codex-git");
     const c = await run("codex", "implement", cr, { FAKE_MODE: "implement-commit" });
-    check("7 codex implement adds only the git common dir as writable root", pair(c.launches[0].args, "--add-dir", join(cr, ".git")) && pair(c.launches[0].args, "-s", "workspace-write") && !c.launches[0].args.some((a) => a.includes("network_access")));
+    check("7 codex implement: workspace-write, offline, no writable git root", !c.launches[0].args.includes("--add-dir") && pair(c.launches[0].args, "-s", "workspace-write") && !c.launches[0].args.some((a) => a.includes("network_access")) && c.result?.gitWritableRoot === null);
     check("7 no relay ever pushes (remote main unchanged)", g(cr, "ls-remote", "origin", "refs/heads/factory/T-1") === "");
   },
 
@@ -226,6 +237,8 @@ const groups = {
     expectThrow("profiles file inside the workspace refused", () => loadProfiles(writeProfiles(() => {}, join(ws, "workers.json"))), /outside workspaceRoot/);
     expectThrow("unknown worker refused", () => resolveWorker(loadProfiles(profilesPath), "ghost", "review", repo), /unknown worker/);
     expectThrow("workspace outside root refused", () => resolveWorker(loadProfiles(profilesPath), "claude-a", "review", scratch), /outside workspaceRoot/);
+    expectThrow("skillsHome on a claude worker refused", () => loadProfiles(writeProfiles((d) => { d.workers["claude-a"].skillsHome = conf; })), /codex-only/);
+    expectThrow("relative denyRead refused", () => loadProfiles(writeProfiles((d) => { d.workers["claude-a"].denyRead = ["secrets"]; })), /absolute paths/);
     expectThrow("injected worker id refused", () => loadProfiles(writeProfiles((d) => { d.workers["a;rm -rf"] = d.workers["claude-a"]; })), /unsupported characters/);
     const relay = (provider, extra) => spawnSync(process.execPath, [join(ROOT, `skills/${provider}-delegate/scripts/relay.mjs`), "--brief", brief(), "--cd", repo, ...extra], { encoding: "utf8" });
     const cases = [
@@ -241,6 +254,9 @@ const groups = {
       ["codex", ["--implement", "--read-only"], /workspace-write/],
       ["codex", ["--implement", "--network-access"], /offline/],
       ["codex", ["--codex-home", "/nope/home"], /not found/],
+      ["codex", ["--home", "relative/home"], /existing absolute directory/],
+      ["codex", ["--codex-config", "no equals sign"], /key=value/],
+      ["claude", ["--deny-read", "relative/secret"], /absolute path/],
     ];
     for (const [provider, extra, pattern] of cases) {
       const r = relay(provider, extra);
@@ -266,6 +282,11 @@ const groups = {
     const alive = (() => { try { process.kill(pid, 0); return true; } catch { return false; } })();
     check("9 profile timeout kills the run and reports timeout", hang.result?.status === "timeout" && hang.exitCode !== 0);
     check("9 timeout fells the grandchild process", !alive);
+    const detachedPid = join(scratch, "detached.pid");
+    const cxHang = await run("codex-hanger", "implement", repo, { FAKE_MODE: "hang", FAKE_PID_FILE: detachedPid, FAKE_DETACH: "1" });
+    await new Promise((r) => setTimeout(r, 500));
+    const detachedAlive = (() => { try { process.kill(Number(readFileSync(detachedPid, "utf8")), 0); return true; } catch { return false; } })();
+    check("9 codex timeout also fells a command in its own process group", cxHang.result?.status === "timeout" && !detachedAlive);
     const outDir = join(scratch, "out", "cancel");
     const profiles = loadProfiles(profilesPath);
     const argv = relayArgv(profiles.workers["claude-a"], { mode: "implement", workspace: repo, brief: brief(), outDir });
@@ -285,7 +306,7 @@ const groups = {
     const cxr = await run("codex", "implement", repo, { FAKE_MODE: "implement-nocommit" }, { session: cx.result.threadId });
     check("10 codex thread id captured and resumed", cx.result?.threadId === "0199aaaa-2222-7222-8222-000000000002" && cxr.launches[0].args.includes("resume") && cxr.launches[0].args.includes(cx.result.threadId));
     const ra = cxr.launches[0].args;
-    check("10 codex implement resume restates sandbox and writable root before `resume`", ra.indexOf("--add-dir") > -1 && ra.indexOf("--add-dir") < ra.indexOf("resume") && pair(ra, "-s", "workspace-write") && ra.indexOf("-s") < ra.indexOf("resume"), JSON.stringify(ra));
+    check("10 codex implement resume restates the sandbox before `resume` and adds no writable root", !ra.includes("--add-dir") && pair(ra, "-s", "workspace-write") && ra.indexOf("-s") < ra.indexOf("resume"), JSON.stringify(ra));
     check("10 passive capacity telemetry captured from claude run", fromRelayResult(ok.result)?.windows?.five_hour?.usedPercent === 31);
     check("10 passive capacity telemetry captured from codex rollout", fromRelayResult(cx.result)?.windows?.seven_day?.usedPercent === 12);
   },
@@ -346,7 +367,7 @@ const groups = {
         id, title: `ticket ${id}`, issue: `.scratch/issues/${id}.md`, repo, remote: "origin", base: "main",
         approval: { approved: true, by: "founder", at: "2026-10-23" }, profiles: profilesPath, implementer: "claude-a",
         review: { mode: "single", worker: "codex" }, mattSkillsDir: process.env.MATT_SKILLS_DIR ?? join(ROOT, "test", "factory", "fixtures"),
-        seams: ["src/feature.js value export"], testCommand: [process.execPath, "-e", "process.exit(require('fs').readFileSync('src/feature.js','utf8').includes('42')?0:1)"],
+        seams: ["src/feature.js value export"], testCommand: ["node", "-e", "process.exit(require('fs').readFileSync('src/feature.js','utf8').includes('42')?0:1)"],
         maxRemediationRounds: 1, forge, ...extra,
       };
       const file = join(scratch, `${id}.ticket.json`);
@@ -361,6 +382,14 @@ const groups = {
     env("implement-commit");
     const unapproved = ticket("T-0", { approval: null });
     check("E no ticket starts without explicit approval", (await runTicket(unapproved, stateDir)) === false && JSON.parse(readFileSync(join(stateDir, "T-0.json"), "utf8")).phase === "AWAITING_APPROVAL");
+
+    const gateLog = join(scratch, "e2e-gate.jsonl");
+    env("implement-edit", { FAKE_LOG: gateLog });
+    const gated = ticket("T-G", { capacityGate: true });
+    const gatedOk = await runTicket(gated, stateDir);
+    const sg = JSON.parse(readFileSync(join(stateDir, "T-G.json"), "utf8"));
+    check("Q harness capacity gate fails closed on unreadable telemetry and dispatches nothing", gatedOk === false && sg.phase === "CAPACITY_SYNC_REQUIRED" && sg.capacityResume === "IMPLEMENTING" && logOf(gateLog).every((l) => !l.args.includes("--plugin-dir")), JSON.stringify(sg));
+    g(repo, "switch", "-q", "main");
 
     const log = join(scratch, "e2e-agent.jsonl");
     env("buggy-then-fix", { FAKE_LOG: log });
@@ -388,21 +417,181 @@ const groups = {
     const again = await runTicket(t1, stateDir);
     check("E re-running a finished ticket is a no-op", again === true && gh().prs.length === 1 && JSON.parse(readFileSync(join(stateDir, "T-1.json"), "utf8")).runs.length === 2);
 
+    check("E PR commits were made by the broker, never by the implementer", g(repo, "log", "--format=%cn", `${s1.baseSha}..factory/T-1`).split("\n").every((n) => n === "factory-broker"));
+    check("E failed test run kept in history with its evidence", s1.testRuns[0].passed === false && s1.testRuns.at(-1).passed === true && s1.testRuns[0].runner === "docker");
     g(repo, "switch", "-q", "main");
-    process.env.FAKE_MODE = "implement-commit";
+    process.env.FAKE_MODE = "implement-edit";
+    const before = logOf(log).length;
     const t2 = ticket("T-2", { dependsOn: ["T-1"] });
+    const t2Unapproved = ticket("T-2", { dependsOn: ["T-1"], approval: null });
+    check("E dependent ticket needs its own approval", (await runTicket(t2Unapproved, stateDir)) === false && JSON.parse(readFileSync(join(stateDir, "T-2.json"), "utf8")).phase === "AWAITING_APPROVAL");
+    writeFileSync(join(scratch, "T-2.ticket.json"), readFileSync(t2Unapproved, "utf8").replace('"approval":null', `"approval":${JSON.stringify({ approved: true, by: "founder", at: "2026-10-23" })}`));
     check("E dependent ticket blocked while prerequisite PR is open (ready, not merged)", (await runTicket(t2, stateDir)) === false && JSON.parse(readFileSync(join(stateDir, "T-2.json"), "utf8")).phase === "BLOCKED_DEPENDENCY");
     const state = gh();
     state.prs[0].state = "MERGED";
+    state.prs[0].mergeCommit = { oid: g(repo, "rev-parse", "factory/T-1") };
     writeFileSync(ghState, JSON.stringify(state));
+    const notOnBase = await runTicket(t2, stateDir);
+    check("E MERGED state alone is not enough: the merge commit must be on the remote base", notOnBase === false && /merge commit not on origin\/main/.test(JSON.parse(readFileSync(join(stateDir, "T-2.json"), "utf8")).reason));
+    check("E no implementation started while the dependency or approval was missing", logOf(log).length === before);
     g(repo, "push", "-q", "origin", "factory/T-1:main");
     process.env.FAKE_REVIEW = "review-block";
+    process.env.FAKE_GH_STALE_VIEWS = "2";
+    writeFileSync(join(scratch, "T-2.ticket.json"), JSON.stringify({ ...JSON.parse(readFileSync(t2, "utf8")), prHeadPollMs: 100 }));
     const blocked = await runTicket(t2, stateDir);
+    delete process.env.FAKE_GH_STALE_VIEWS;
     const s2 = JSON.parse(readFileSync(join(stateDir, "T-2.json"), "utf8"));
     check("E dependency satisfied only after the prerequisite merged", s2.runs.length >= 1);
     check("E blocking review keeps the PR draft and exhausts bounded remediation", blocked === false && s2.phase === "BLOCKED" && gh().prs.find((p) => p.headRefName === "factory/T-2")?.isDraft === true, `${s2.phase} ${s2.reason}`);
+    check("E remediation push waited out a lagging PR head instead of failing", !/is not the tested head/.test(s2.reason ?? "") && gh().staleViews === 0, `${s2.reason} stale=${gh().staleViews}`);
     check("E one review per head SHA", Object.keys(s2.reviews).length === new Set(Object.keys(s2.reviews)).size && Object.keys(s2.reviews).length === s2.runs.length);
-    for (const key of ["FAKE_MODE", "FAKE_COUNTER", "FAKE_LOG", "FAKE_REVIEW"]) delete process.env[key];
+    delete process.env.FAKE_REVIEW;
+
+    g(repo, "switch", "-q", "main");
+    const pidFile = join(scratch, "e2e-hang.pid");
+    const hangLog = join(scratch, "e2e-hang.jsonl");
+    Object.assign(process.env, { FAKE_MODE: "init-then-hang", FAKE_PID_FILE: pidFile, FAKE_LOG: hangLog });
+    const t3 = ticket("T-3", { implementer: "hanger", maxInterruptions: 1 });
+    const interrupted = await runTicket(t3, stateDir);
+    const s3a = JSON.parse(readFileSync(join(stateDir, "T-3.json"), "utf8"));
+    const grandchildAlive = (() => { try { process.kill(Number(readFileSync(pidFile, "utf8")), 0); return true; } catch { return false; } })();
+    check("D timeout is recorded as an interruption with its session", interrupted === false && s3a.phase === "INTERRUPTED" && s3a.runs[0].status === "timeout" && s3a.interruption.sessionId === "aaaaaaaa-1111-4111-8111-000000000001", JSON.stringify(s3a.runs));
+    check("D timeout cleaned up the process tree", !grandchildAlive);
+    check("D reconciliation kept the partial edits and made no commit", s3a.interruption.dirty.some((l) => l.includes("src/")) && g(repo, "rev-list", "--count", `${s3a.baseSha}..factory/T-3`) === "0");
+    process.env.FAKE_MODE = "implement-edit";
+    process.env.FACTORY_CRASH_AT = "after-commit-before-checkpoint";
+    const crashed3 = spawnSync(process.execPath, [join(ROOT, "factory/harness.mjs"), "--ticket", t3, "--state-dir", stateDir], { encoding: "utf8", env: process.env });
+    check("D simulated crash right after the broker commit", crashed3.status === 137, crashed3.stderr);
+    process.env.FACTORY_CRASH_AT = "during-tests";
+    const crashed4 = spawnSync(process.execPath, [join(ROOT, "factory/harness.mjs"), "--ticket", t3, "--state-dir", stateDir], { encoding: "utf8", env: process.env });
+    delete process.env.FACTORY_CRASH_AT;
+    check("D simulated crash while the test container runs", crashed4.status === 137, crashed4.stderr);
+    const finished = await runTicket(t3, stateDir);
+    const s3 = JSON.parse(readFileSync(join(stateDir, "T-3.json"), "utf8"));
+    const resumes = logOf(hangLog).filter((l) => l.args.includes("--resume"));
+    check("D the interrupted session was resumed with the same profile flags and workspace", resumes.length === 1 && pair(resumes[0].args, "--resume", "aaaaaaaa-1111-4111-8111-000000000001") && pair(resumes[0].args, "--setting-sources", "project,local") && resumes[0].cwd === repo);
+    check("D broker commit adopted after the crash (exactly one commit)", s3.runs.find((r) => r.kind === "implement-resume")?.broker?.adopted === true && g(repo, "rev-list", "--count", `${s3.baseSha}..factory/T-3`) === "1", JSON.stringify(s3.runs));
+    check("D leftover test container removed before the rerun", s3.testRuns.at(-1).leftoversRemoved >= 1 && s3.testRuns.at(-1).containersAfter === 0, JSON.stringify(s3.testRuns.at(-1)));
+    check("D ticket finished with one PR", finished === true && gh().prs.filter((p) => p.headRefName === "factory/T-3").length === 1);
+    for (const key of ["FAKE_MODE", "FAKE_COUNTER", "FAKE_LOG", "FAKE_REVIEW", "FAKE_PID_FILE"]) delete process.env[key];
+  },
+
+  async broker() {
+    const fresh = (name) => {
+      const { repo } = freshRepo(name);
+      g(repo, "switch", "-q", "-c", "factory/T-9");
+      return { repo, before: snapshot(repo) };
+    };
+    const opts = (before, extra = {}) => ({ branch: "factory/T-9", guardBefore: before, runId: "T-9/implement-0", message: "feat: x", ...extra });
+    let { repo, before } = fresh("broker-ok");
+    writeFileSync(join(repo, "src", "feature.js"), "export const value = 42;\n");
+    const first = brokerCommit(repo, opts(before));
+    const again = brokerCommit(repo, opts(before));
+    check("B broker commits the edits once, as factory-broker, with the run trailer", first.ok && first.commit && g(repo, "log", "-1", "--format=%cn|%B").startsWith("factory-broker|feat: x") && g(repo, "log", "-1", "--format=%B").includes("Factory-Run: T-9/implement-0"));
+    check("B rerun after a crash adopts the commit instead of committing twice", again.ok && again.adopted === true && again.commit === first.commit && g(repo, "rev-list", "--count", "main..factory/T-9") === "1");
+    ({ repo, before } = fresh("broker-agent-commit"));
+    writeFileSync(join(repo, "src", "feature.js"), "export const value = 1;\n");
+    g(repo, "commit", "-qam", "agent commit");
+    check("B a commit made by the implementer is refused", brokerCommit(repo, opts(before)).ok === false);
+    ({ repo, before } = fresh("broker-workflow"));
+    mkdirSync(join(repo, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(repo, ".github", "workflows", "ci.yml"), "on: push\n");
+    check("B change to a protected path (.github/workflows) is refused", /protected path/.test(brokerCommit(repo, opts(before)).reason ?? ""));
+    ({ repo, before } = fresh("broker-tracked-workflow"));
+    mkdirSync(join(repo, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(repo, ".github", "workflows", "ci.yml"), "on: push\n");
+    g(repo, "add", "-A");
+    g(repo, "commit", "-qm", "workflow on branch");
+    before = snapshot(repo);
+    writeFileSync(join(repo, ".github", "workflows", "ci.yml"), "on: pull_request\n");
+    const tracked = brokerCommit(repo, opts(before));
+    check("B modified tracked protected file is refused (porcelain status column kept)", /\.github\/workflows\/ci\.yml: protected path/.test(tracked.reason ?? ""), tracked.reason);
+    ({ repo, before } = fresh("broker-paths"));
+    writeFileSync(join(repo, "src", "feature.js"), "export const value = 5;\n");
+    check("B broker reports exact changed paths", JSON.stringify(brokerCommit(repo, opts(before)).files) === '["src/feature.js"]');
+    ({ repo, before } = fresh("broker-symlink"));
+    spawnSync("ln", ["-s", scratch, join(repo, "escape")]);
+    check("B symlink leaving the workspace is refused", /symlink leaves/.test(brokerCommit(repo, opts(before)).reason ?? ""));
+    ({ repo, before } = fresh("broker-secret"));
+    writeFileSync(join(repo, "src", "key.txt"), `-----BEGIN ${"OPENSSH"} PRIVATE KEY-----\nnot a real key, contract fixture\n`);
+    check("B content shaped like a credential is refused", /credential/.test(brokerCommit(repo, opts(before)).reason ?? ""));
+    ({ repo, before } = fresh("broker-hook"));
+    writeFileSync(join(repo, ".git", "hooks", "post-commit"), "#!/bin/sh\necho planted\n", { mode: 0o755 });
+    writeFileSync(join(repo, "src", "feature.js"), "export const value = 3;\n");
+    check("B tampered hooks stop the broker before it commits", /git hooks changed/.test(brokerCommit(repo, opts(before)).reason ?? "") && g(repo, "rev-list", "--count", "main..factory/T-9") === "0");
+    check("B commit subject comes from the FACTORY_COMMIT line, one line, bounded", commitMessage("x\nFACTORY_COMMIT: feat: add  a\tthing\n", "fallback") === "feat: add  a thing" && commitMessage("no line", "fallback") === "fallback");
+  },
+
+  async isolation() {
+    const { repo } = freshRepo("iso");
+    const outside = join(scratch, "outside-canary");
+    mkdirSync(outside);
+    writeFileSync(join(repo, "probe.mjs"), [
+      'import { writeFileSync } from "node:fs";',
+      "const r = {};",
+      'for (const [k, p] of [["ws", "ok.txt"], ["git", ".git/canary"], ["out", process.env.OUT + "/x"]]) { try { writeFileSync(p, "x"); r[k] = "allowed"; } catch (e) { r[k] = e.code; } }',
+      'console.log("PROBE " + JSON.stringify(r));',
+    ].join("\n"));
+    const res = await runTestsIsolated({ workspace: repo, command: ["node", "probe.mjs"], image: "node:22-alpine", label: "contract-iso", attempt: 1, env: { OUT: outside } });
+    const probe = JSON.parse(/PROBE (\{.*\})/.exec(res.tail)?.[1] ?? "{}");
+    check("I container test run may write the workspace", probe.ws === "allowed", res.tail);
+    check("I container test run cannot write .git (read-only mount)", probe.git === "EROFS");
+    check("I container test run cannot reach host paths outside the workspace", probe.out === "ENOENT" && readdirSync(outside).length === 0);
+    const args = dockerArgs({ workspace: repo, command: ["npm", "test"], image: "node:22-alpine", name: "n", label: "l" });
+    check("I container is offline, read-only root, no capabilities, unprivileged", pair(args, "--network", "none") && args.includes("--read-only") && pair(args, "--cap-drop", "ALL") && pair(args, "--security-opt", "no-new-privileges") && args.includes(`${join(repo, ".git")}:/work/.git:ro`));
+    const slow = await runTestsIsolated({ workspace: repo, command: ["node", "-e", "setInterval(()=>{},1000)"], image: "node:22-alpine", label: "contract-iso", attempt: 2, timeoutMs: 2000 });
+    check("I test timeout kills the container and leaves none behind", slow.status === "timeout" && slow.containersAfter === 0);
+    let refused = null;
+    try { dockerArgs({ workspace: repo, command: [], image: "node; rm -rf /", name: "n", label: "l" }); } catch (error) { refused = error.message; }
+    check("I non-reference test image refused", /plain image reference/.test(refused ?? ""));
+  },
+
+  async review() {
+    const { repo } = freshRepo("rev");
+    const base = g(repo, "rev-parse", "HEAD");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    mkdirSync(join(repo, ".scratch"), { recursive: true });
+    writeFileSync(join(repo, ".claude", "settings.json"), '{"hooks":{}}\n');
+    writeFileSync(join(repo, ".scratch", "issue.md"), "value must be 42\n");
+    writeFileSync(join(repo, "src", "feature.js"), "export const value = 42;\n");
+    g(repo, "add", "-A");
+    g(repo, "commit", "-qm", "change");
+    const head = g(repo, "rev-parse", "HEAD");
+    const root = join(ws, ".factory-review", "T-R");
+    const meta = prepareSnapshot(repo, { base, head, issue: ".scratch/issue.md", root });
+    check("R snapshot is pinned to the head SHA", meta.head === head && meta.base === base);
+    check("R trusted diff and requirements are prepared", readFileSync(join(meta.dir, "diff.patch"), "utf8").includes("+export const value = 42;") && readFileSync(join(meta.dir, "requirements.md"), "utf8").includes("value must be 42"));
+    check("R agent config is stripped from the snapshot", meta.stripped.includes(".claude") && !existsSync(join(meta.src, ".claude")));
+    let writeError = null;
+    try { writeFileSync(join(meta.src, "src", "feature.js"), "tampered\n"); } catch (error) { writeError = error.code; }
+    check("R snapshot files are read-only", writeError === "EACCES");
+    const rv = await run("codex", "review", meta.src, { FAKE_MODE: "review-write" });
+    check("R reviewer write attempt in the snapshot fails and leaves it unchanged", !existsSync(join(meta.src, "REVIEW_WAS_HERE.txt")) && checkSnapshot(meta).unchanged && pair(rv.launches[0].args, "-s", "read-only"));
+    check("R preparing the same head again reuses the snapshot", prepareSnapshot(repo, { base, head, issue: ".scratch/issue.md", root }).hash === meta.hash);
+    chmodSync(join(meta.src, "src", "feature.js"), 0o644);
+    writeFileSync(join(meta.src, "src", "feature.js"), "tampered\n");
+    check("R a changed snapshot is detected after review", checkSnapshot(meta).unchanged === false);
+    const dr = await run("claude-denyread", "review", repo);
+    const drProfile = JSON.parse(readFileSync(dr.result.settingsPath, "utf8"));
+    check("R claude deny-read paths become Read deny rules", drProfile.permissions.deny.includes(`Read(/${join(scratch, "private")}/**)`));
+    const di = await run("claude-denyread", "implement", repo, { FAKE_MODE: "implement-edit" });
+    const diProfile = JSON.parse(readFileSync(di.result.settingsPath, "utf8"));
+    check("R claude deny-read paths reach the shell sandbox in implement mode", (diProfile.sandbox?.filesystem?.denyRead ?? []).includes(join(scratch, "private")));
+  },
+
+  async skillpolicy() {
+    const home = join(scratch, "plugins", "matt");
+    mkdirSync(join(home, ".agents", "skills", "implement"), { recursive: true });
+    mkdirSync(join(scratch, "elsewhere", "other"), { recursive: true });
+    for (const p of [join(home, ".agents", "skills", "implement", "SKILL.md"), join(scratch, "elsewhere", "other", "SKILL.md")]) writeFileSync(p, "x\n");
+    const policy = skillOverrides([
+      { name: "implement", path: join(home, ".agents", "skills", "implement", "SKILL.md"), scope: "user" },
+      { name: "other", path: join(scratch, "elsewhere", "other", "SKILL.md"), scope: "user" },
+    ], home);
+    check("S skills outside the Factory skills home are disabled, pinned ones kept", policy.allowed.map((s) => s.name).join() === "implement" && policy.disabled.map((s) => s.name).join() === "other");
+    check("S overrides use Codex skills.config and disable plugins", policy.overrides[0] === "features.plugins=false" && policy.overrides[1] === `skills.config=[{path=${JSON.stringify(join(scratch, "elsewhere", "other", "SKILL.md"))},enabled=false}]`);
+    const argv = relayArgv(loadProfiles(profilesPath).workers["codex-skilled"], { mode: "implement", workspace: ws, brief: "b", outDir: "o", codexOverrides: policy.overrides });
+    check("S codex worker gets the Factory HOME and the overrides", pair(argv, "--home", realpathSync(home)) && pair(argv, "--codex-config", "features.plugins=false"));
   },
 };
 
@@ -412,7 +601,9 @@ try {
     console.log(`# ${name}`);
     await fn();
   }
+  check("contract run left no stray files in the fork", !existsSync(join(ROOT, "src")));
 } finally {
+  spawnSync("chmod", ["-R", "u+w", scratch]);
   rmSync(scratch, { recursive: true, force: true });
   rmSync(join(ROOT, "test", "factory", "fixtures", "skills"), { recursive: true, force: true });
 }

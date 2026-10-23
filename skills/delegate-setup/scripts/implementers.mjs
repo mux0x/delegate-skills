@@ -107,7 +107,7 @@ export const IMPLEMENTERS = Object.freeze([
       entry: "file",
       match: /^rollout-.*\.jsonl$/,
     },
-    supports: ["model", "effort", "sandbox", "timeout", "readOnly", "worker", "codexHome", "codexBin", "ignoreUserConfig"],
+    supports: ["model", "effort", "sandbox", "timeout", "readOnly", "worker", "codexHome", "codexBin", "ignoreUserConfig", "home"],
     winShell: true,
   },
   {
@@ -473,6 +473,7 @@ export const ALL_DIALS = Object.freeze([
   "codexHome",
   "codexBin",
   "ignoreUserConfig",
+  "home",
 ]);
 // Factory worker-profile dials: absolute paths to an official CLI and its profile directory.
-export const PATH_DIALS = Object.freeze(["configDir", "claudeBin", "codexHome", "codexBin"]);
+export const PATH_DIALS = Object.freeze(["configDir", "claudeBin", "codexHome", "codexBin", "home"]);

@@ -7,7 +7,7 @@ export function makeForge({ gh = "gh", repo, env = process.env }) {
   const run = (args, input) => execFileSync(gh, [...args, "--repo", repo], {
     encoding: "utf8", env, input, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], timeout: 60_000,
   }).trim();
-  const view = (number) => JSON.parse(run(["pr", "view", String(number), "--json", "number,state,isDraft,headRefOid,headRefName,url,mergedAt"]));
+  const view = (number) => JSON.parse(run(["pr", "view", String(number), "--json", "number,state,isDraft,headRefOid,headRefName,baseRefName,url,mergedAt,mergeCommit"]));
   return {
     repo,
     findPr(head) {

@@ -79,9 +79,12 @@
  *   --config-dir <abs dir>            Child CLAUDE_CONFIG_DIR (selects the official profile).
  *   --implement                       Factory implementation mode: enables skills (Skill and Agent
  *                                     tools, no --disable-slash-commands), loads only
- *                                     project/local settings, and lets the run commit on
- *                                     the current branch. Push, gh, and nested claude stay
- *                                     denied; the Factory git guard verifies refs after.
+ *                                     project/local settings. Git metadata (.git, the common
+ *                                     dir) and .claude/ are write-protected in the shell
+ *                                     sandbox and for Edit/Write; commit, push, gh, and nested
+ *                                     claude are denied. The Factory commits for the run.
+ *   --deny-read <abs path>            Deny reads of this path to the sandboxed shell and to
+ *                                     Read/Grep/Glob (repeatable).
  *   --plugin-dir <dir>                Session-only skill plugin (repeatable, implement only).
  *   --mcp-config <file>               Strict MCP config for this run (replaces mcp__* deny).
  *   --allow-mcp-tool <mcp__s__t>      Pre-approve one MCP tool (repeatable); every other
@@ -298,6 +301,8 @@ function parseArgs(argv) {
     pluginDirs: [],
     mcpConfig: null,
     allowMcpTools: [],
+    denyRead: [],
+    protectedPaths: [],
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -339,6 +344,7 @@ function parseArgs(argv) {
       case "--plugin-dir": opts.pluginDirs.push(resolve(next())); break;
       case "--mcp-config": opts.mcpConfig = resolve(next()); break;
       case "--allow-mcp-tool": opts.allowMcpTools.push(next()); break;
+      case "--deny-read": opts.denyRead.push(next()); break;
       default:
         fail(`unknown option: ${arg}`);
     }
@@ -402,6 +408,8 @@ function validateFactoryOptions(opts) {
     fail("--implement cannot be combined with --read-only or --dangerously-skip-permissions");
   }
   if (opts.pluginDirs.length && !opts.implement) fail("--plugin-dir requires --implement");
+  for (const path of opts.denyRead) if (!isAbsolute(path)) fail("--deny-read must be an absolute path");
+  if (opts.implement) opts.protectedPaths = gitProtectedPaths(opts.cd);
   if (opts.claudeBin !== null) {
     if (!isAbsolute(opts.claudeBin)) fail("--claude-bin must be an absolute path");
     try {
@@ -587,6 +595,23 @@ function toolSurface(opts) {
   return `Read,Glob,Grep,Edit,Write,${shellTool()}`;
 }
 
+// Implement mode never writes git metadata: the Factory commits after the run. The git dir,
+// the common dir (outside the worktree for linked worktrees) and .claude/ are protected.
+function gitProtectedPaths(cwd) {
+  const paths = new Set([join(cwd, ".git"), join(cwd, ".claude")]);
+  for (const flag of ["--git-dir", "--git-common-dir"]) {
+    try {
+      const dir = execFileSync("git", ["rev-parse", "--path-format=absolute", flag], {
+        cwd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (dir) paths.add(dir);
+    } catch {
+      // Not a git checkout: only the fixed paths apply.
+    }
+  }
+  return [...paths];
+}
+
 function profileSettings(opts) {
   const shell = shellTool();
   const shellSandboxEnabled = !opts.readOnly && process.platform !== "win32";
@@ -597,17 +622,21 @@ function profileSettings(opts) {
       : {}),
     permissions: {
       deny: opts.readOnly
-        ? []
+        ? opts.denyRead.flatMap((path) => [`Read(/${path}/**)`, `Read(/${path})`])
         : opts.implement
           ? [
-              // Implement mode lets Matt's /implement commit on the Factory-created
-              // branch. Remote and forge side effects stay with the Factory.
+              // The Factory commits, pushes and opens PRs; the run only edits files.
+              `${shell}(git commit *)`,
+              `${shell}(git * commit *)`,
+              `${shell}(git * commit)`,
               `${shell}(git push *)`,
               `${shell}(git * push *)`,
               `${shell}(git * push)`,
               `${shell}(gh *)`,
               `${shell}(claude *)`,
               `${shell}(*claude-delegate*)`,
+              ...opts.protectedPaths.flatMap((path) => [`Edit(/${path}/**)`, `Write(/${path}/**)`]),
+              ...opts.denyRead.flatMap((path) => [`Read(/${path}/**)`, `Read(/${path})`]),
             ]
           : [
             // Two-wildcard git forms require text after the subcommand, so the
@@ -636,6 +665,8 @@ function profileSettings(opts) {
             excludedCommands: [],
             filesystem: {
               disabled: false,
+              ...(opts.protectedPaths.length ? { denyWrite: opts.protectedPaths } : {}),
+              ...(opts.denyRead.length ? { denyRead: opts.denyRead } : {}),
             },
           },
         }
@@ -1114,7 +1145,8 @@ function makeResultWriter(opts, version, run, state, beforeTree, beforeFingerpri
       ...(opts.worker === null ? {} : { worker: opts.worker }),
       ...(opts.claudeBin === null ? {} : { claudeBin: opts.claudeBin }),
       ...(opts.configDir === null ? {} : { configDir: opts.configDir }),
-      ...(opts.implement ? { mode: "implement", pluginDirs: opts.pluginDirs, skillCalls: state.skillCalls } : {}),
+      ...(opts.implement ? { mode: "implement", pluginDirs: opts.pluginDirs, skillCalls: state.skillCalls, protectedPaths: opts.protectedPaths } : {}),
+      ...(opts.denyRead.length ? { denyRead: opts.denyRead } : {}),
       ...(opts.mcpConfig === null ? {} : {
         mcpConfig: opts.mcpConfig,
         allowedMcpTools: opts.allowMcpTools,

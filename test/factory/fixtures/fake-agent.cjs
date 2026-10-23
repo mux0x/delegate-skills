@@ -52,12 +52,21 @@ let final = `fake ${provider} done (${mode})`;
 
 switch (mode) {
   case "implement-commit": writeFeature(42); commit("feat: value 42"); break;
-  case "implement-nocommit": writeFeature(42); break;
+  case "implement-nocommit":
+  case "implement-edit": writeFeature(42); final = "done\nFACTORY_COMMIT: feat: value 42"; break;
   case "buggy-then-fix": {
     const n = counter();
     writeFeature(n === 1 ? 41 : 42);
-    commit(n === 1 ? "feat: value" : "fix: value 42");
+    final = n === 1 ? "done\nFACTORY_COMMIT: feat: value" : "fixed\nFACTORY_COMMIT: fix: value 42";
     break;
+  }
+  case "init-then-hang": {
+    writeFeature(7);
+    console.log(JSON.stringify(provider === "claude" ? { type: "system", subtype: "init", session_id: SESSION, mcp_servers: [] } : { type: "thread.started", thread_id: THREAD }));
+    const grandchild = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    if (process.env.FAKE_PID_FILE) fs.writeFileSync(process.env.FAKE_PID_FILE, String(grandchild.pid));
+    setInterval(() => {}, 1000);
+    return;
   }
   case "tamper-main": writeFeature(42); commit("feat"); g("branch", "-f", "main", "HEAD"); break;
   case "tamper-new-branch": writeFeature(42); commit("feat"); g("branch", "sneaky"); break;
@@ -71,11 +80,11 @@ switch (mode) {
   case "tamper-config": writeFeature(42); commit("feat"); g("config", "core.fsmonitor", "touch /tmp/factory-poc-pwned"); break;
   case "rewrite-history": g("reset", "-q", "--hard", "HEAD~1"); writeFeature(42); commit("rewritten"); break;
   case "switch-branch": g("switch", "-q", "-c", "elsewhere"); writeFeature(42); commit("feat"); break;
-  case "review-write": fs.writeFileSync("REVIEW_WAS_HERE.txt", "x\n"); final = "```json\n{\"schema\":\"factory.single-review.v1\",\"verdict\":\"pass\",\"findings\":[]}\n```"; break;
+  case "review-write": try { fs.writeFileSync("REVIEW_WAS_HERE.txt", "x\n"); } catch { final = "write refused"; } final = "```json\n{\"schema\":\"factory.single-review.v1\",\"verdict\":\"pass\",\"findings\":[]}\n```"; break;
   case "review-pass": final = "## Standards\nok\n## Spec\nok\n```json\n{\"schema\":\"factory.single-review.v1\",\"verdict\":\"pass\",\"findings\":[]}\n```"; break;
   case "review-block": final = "```json\n{\"schema\":\"factory.single-review.v1\",\"verdict\":\"changes-requested\",\"findings\":[{\"axis\":\"spec\",\"severity\":\"blocking\",\"claim\":\"value must be 42\"}]}\n```"; break;
   case "hang": {
-    const grandchild = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const grandchild = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore", detached: process.env.FAKE_DETACH === "1" });
     if (process.env.FAKE_PID_FILE) fs.writeFileSync(process.env.FAKE_PID_FILE, String(grandchild.pid));
     setInterval(() => {}, 1000);
     return;

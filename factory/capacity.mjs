@@ -4,6 +4,9 @@
 //   node factory/capacity.mjs claude <claude-bin> [<config-dir>]
 //   node factory/capacity.mjs codex <codex-bin> [<codex-home>]
 import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { workerEnv } from "./profiles.mjs";
 
@@ -20,11 +23,15 @@ export function parseClaudeUsage(text) {
   return { five_hour: window("Current session"), seven_day: window("Current week \\(all models\\)") };
 }
 
+// Probes run from an empty directory so no repository's project settings or files are involved.
+let neutral = null;
+const neutralDir = () => (neutral ??= mkdtempSync(join(tmpdir(), "factory-capacity-")));
+
 export function claudeUsage(bin, configDir = null) {
   const env = workerEnv();
   if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
   const run = spawnSync(bin, ["-p", "--output-format", "json", "--setting-sources", "project,local", "--strict-mcp-config", "--tools", ""], {
-    input: "/usage", encoding: "utf8", env, timeout: 60_000,
+    input: "/usage", encoding: "utf8", env, timeout: 60_000, cwd: neutralDir(),
   });
   const observedAt = new Date().toISOString();
   let doc;
@@ -46,7 +53,7 @@ export function codexUsage(bin, codexHome = null, timeoutMs = 20_000) {
   const env = workerEnv();
   if (codexHome) env.CODEX_HOME = codexHome;
   return new Promise((resolveUsage) => {
-    const child = spawn(bin, ["app-server"], { env, stdio: ["pipe", "pipe", "ignore"] });
+    const child = spawn(bin, ["app-server"], { env, cwd: neutralDir(), stdio: ["pipe", "pipe", "ignore"] });
     let buffer = "";
     const finish = (value) => {
       clearTimeout(timer);

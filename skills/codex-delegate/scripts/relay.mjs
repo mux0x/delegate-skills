@@ -80,10 +80,12 @@
  *   --worker <id>           Worker-profile label recorded in result.json.
  *   --codex-bin <abs path>  Launch this executable instead of `codex` on PATH.
  *   --codex-home <abs dir>  Child CODEX_HOME (selects the official profile).
- *   --implement             Factory implementation mode: workspace-write sandbox plus the
- *                           repository's git common dir as a writable root, so Matt's
- *                           $implement can commit. Network stays off; the Factory git
- *                           guard verifies refs, config, and hooks after the run.
+ *   --implement             Factory implementation mode: workspace-write sandbox, offline.
+ *                           Codex keeps .git read-only, so the run edits files and the
+ *                           Factory commits for it.
+ *   --home <abs dir>        Child HOME, so user-level skills come from <dir>/.agents/skills.
+ *                           Authentication still comes from CODEX_HOME.
+ *   --codex-config <k=v>    Extra `-c k=v` override (repeatable), e.g. skills.config.
  *   --mcp-config <file>     JSON {"servers":{"<name>":{"command","args","enabledTools"}}};
  *                           each server is passed as -c mcp_servers.<name>.* with only its
  *                           enabledTools exposed. Implies --ignore-user-config so ambient
@@ -209,6 +211,8 @@ function parseArgs(argv) {
     worker: null,
     codexBin: null,
     codexHome: null,
+    home: null,
+    codexConfig: [],
     implement: false,
     mcpConfig: null,
     mcpServers: null,
@@ -250,6 +254,8 @@ function parseArgs(argv) {
       case "--worker": opts.worker = next(); break;
       case "--codex-bin": opts.codexBin = next(); break;
       case "--codex-home": opts.codexHome = next(); break;
+      case "--home": opts.home = next(); break;
+      case "--codex-config": opts.codexConfig.push(next()); break;
       case "--implement": opts.implement = true; flagged.add("sandbox"); flagged.add("readOnly"); break;
       case "--mcp-config": opts.mcpConfig = resolve(next()); break;
       default:
@@ -338,15 +344,15 @@ function validateFactoryOptions(opts) {
     if (opts.sandbox !== "workspace-write") fail("--implement runs in the workspace-write sandbox; drop --sandbox/--read-only");
     if (opts.networkAccess) fail("--implement keeps the sandbox offline; drop --network-access");
     try {
-      const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-        cwd: opts.cd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-      if (!common) throw new Error("empty");
-      opts.gitWritableRoot = common;
+      execFileSync("git", ["rev-parse", "--git-dir"], { cwd: opts.cd, timeout: 10_000, stdio: "ignore" });
       opts.sandboxConfigured = true;
     } catch {
       fail("--implement requires --cd inside a git repository");
     }
+  }
+  if (opts.home !== null && (!isAbsolute(opts.home) || !existsSync(opts.home))) fail("--home must be an existing absolute directory");
+  for (const override of opts.codexConfig) {
+    if (!/^[A-Za-z0-9_.-]+=/.test(override)) fail(`--codex-config must be key=value: ${override}`);
   }
   if (opts.mcpConfig !== null) {
     let parsed;
@@ -451,6 +457,7 @@ function versionProbeTimeout(opts) {
 function codexEnv(opts) {
   const env = opts.cleanEnv ? cleanEnvironment(opts) : { ...process.env };
   if (opts.codexHome !== null) env.CODEX_HOME = opts.codexHome;
+  if (opts.home !== null) env.HOME = opts.home;
   if (process.platform === "win32" && opts.sandbox !== "danger-full-access") removeWindowsAppsFromPath(env);
   return env;
 }
@@ -557,6 +564,7 @@ function buildArgv(opts, finalPath) {
   if (opts.subagentEffort !== null) argv.push("-c", `agents.default_subagent_reasoning_effort=${opts.subagentEffort}`);
   if (opts.webSearch !== null) argv.push("-c", `web_search=${opts.webSearch}`);
   if (opts.networkAccess) argv.push("-c", "sandbox_workspace_write.network_access=true");
+  for (const override of opts.codexConfig) argv.push("-c", override);
   if (opts.skipGitRepoCheck) argv.push("--skip-git-repo-check");
   for (const [name, server] of Object.entries(opts.mcpServers || {})) {
     argv.push("-c", `mcp_servers.${name}.command=${JSON.stringify(server.command)}`);
@@ -644,6 +652,7 @@ function makeResultWriter(opts, version, run) {
       ...(opts.worker === null ? {} : { worker: opts.worker }),
       ...(opts.codexBin === null ? {} : { codexBin: opts.codexBin }),
       ...(opts.codexHome === null ? {} : { codexHome: opts.codexHome }),
+      ...(opts.home === null ? {} : { home: opts.home }),
       ...(opts.implement ? { mode: "implement", gitWritableRoot: opts.gitWritableRoot } : {}),
       ...(opts.mcpServers === null ? {} : { mcpServers: Object.fromEntries(Object.entries(opts.mcpServers).map(([name, server]) => [name, server.enabledTools])) }),
       ...extra,
@@ -691,6 +700,46 @@ function rolloutTrace(opts, threadId) {
     } catch { /* partial line */ }
   }
   return { skillTrace: { rollout, skills }, ...(rateLimits ? { rateLimits } : {}) };
+}
+
+// Codex starts each shell command in its own process group, so felling Codex's group alone
+// orphans running commands. Collect descendant groups while the tree is still connected.
+function descendantGroups(rootPid) {
+  let rows;
+  try {
+    rows = execFileSync("ps", ["-axo", "pid=,ppid=,pgid="], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return [];
+  }
+  const procs = rows.split("\n").map((line) => line.trim().split(/\s+/).map(Number)).filter((row) => row.length === 3 && row.every(Number.isFinite));
+  const tree = new Set([rootPid]);
+  const groups = new Set();
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const [pid, ppid, pgid] of procs) {
+      if (tree.has(ppid) && !tree.has(pid)) {
+        tree.add(pid);
+        groups.add(pgid);
+        grew = true;
+      }
+    }
+  }
+  for (const own of [rootPid, process.pid, 0, 1]) groups.delete(own);
+  return [...groups];
+}
+
+function killCodexTree(child, signal = "SIGTERM") {
+  if (child && child.pid && process.platform !== "win32") {
+    child.descendantGroups = [...new Set([...(child.descendantGroups ?? []), ...descendantGroups(child.pid)])];
+    for (const group of child.descendantGroups) {
+      try {
+        process.kill(-group, signal);
+      } catch {
+        // That command group already exited.
+      }
+    }
+  }
+  killChild(child, signal);
 }
 
 function reportUnavailable(writeResult, resultPath) {
@@ -807,9 +856,9 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
         child.stdout.destroy();
         child.stderr.destroy();
       });
-      killChild(child);
+      killCodexTree(child);
       sigkillTimer = setTimeout(() => {
-        if (!settled) killChild(child, "SIGKILL");
+        if (!settled) killCodexTree(child, "SIGKILL");
       }, 10_000);
     }, timeoutMs);
   }
@@ -841,9 +890,9 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
       };
       const result = writeResult(abortedFields);
       printSummary(result, run.resultPath);
-      killChild(child);
+      killCodexTree(child);
       setTimeout(() => {
-        killChild(child, "SIGKILL");
+        killCodexTree(child, "SIGKILL");
         // the child may flush files during the grace window; refresh the snapshot so the
         // artifact matches the tree the orchestrator will actually find
         writeResult({ ...abortedFields, touchedFiles: gitTouchedFiles(opts.cd) });
@@ -885,7 +934,7 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
     clearWatchdog();
     // a descendant that ignored SIGTERM must not outlive the timeout report: once the
     // parent is down, sweep the group (no-op where taskkill already felled the tree)
-    if (watchdogFired) killChild(child, "SIGKILL");
+    if (watchdogFired) killCodexTree(child, "SIGKILL");
     if (stdoutBuf.trim()) {
       const tid = recordEventLine(run.eventsPath, stdoutBuf);
       if (tid) threadId = tid;

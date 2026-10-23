@@ -30,9 +30,13 @@ if (sub === "list") {
   console.log(`https://example.invalid/pr/${number}`);
 } else if (sub === "view") {
   const pr = state.prs.find((p) => p.number === Number(args[2]));
+  if (!pr) { save(); process.exit(1); }
+  // FAKE_GH_STALE_VIEWS simulates GitHub's lag: that many views still report the previous head.
+  const shaped = shape(pr);
+  state.staleViews = state.staleViews ?? Number(process.env.FAKE_GH_STALE_VIEWS ?? 0);
+  if (state.staleViews > 0 && pr.lastHead && pr.lastHead !== shaped.headRefOid) { state.staleViews -= 1; shaped.headRefOid = pr.lastHead; } else pr.lastHead = shaped.headRefOid;
   save();
-  if (!pr) process.exit(1);
-  console.log(JSON.stringify(shape(pr)));
+  console.log(JSON.stringify(shaped));
 } else if (sub === "ready") {
   state.prs.find((p) => p.number === Number(args[2])).isDraft = false;
   save();

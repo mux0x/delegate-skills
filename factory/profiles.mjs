@@ -11,7 +11,7 @@ const PROVIDERS = {
   codex: { profileDir: "codexHome", envVar: "CODEX_HOME" },
 };
 const MODES = new Set(["implement", "review"]);
-const WORKER_KEYS = new Set(["provider", "bin", "configDir", "codexHome", "model", "effort", "modes", "pluginDirs", "mcp", "timeout", "resume"]);
+const WORKER_KEYS = new Set(["provider", "bin", "configDir", "codexHome", "model", "effort", "modes", "pluginDirs", "mcp", "timeout", "resume", "skillsHome", "denyRead"]);
 
 // Variables that would switch a subscription CLI onto paid API billing, point it at another
 // endpoint, or carry another profile's identity into this one.
@@ -73,6 +73,10 @@ function validateWorker(id, w) {
   const modes = w.modes ?? ["review"];
   if (!Array.isArray(modes) || !modes.every((mode) => MODES.has(mode))) throw new Error(`worker ${id}: modes must be implement/review`);
   if (w.pluginDirs !== undefined && w.provider !== "claude") throw new Error(`worker ${id}: pluginDirs is claude-only`);
+  if (w.skillsHome !== undefined && w.provider !== "codex") throw new Error(`worker ${id}: skillsHome is codex-only`);
+  if (w.denyRead !== undefined && !(Array.isArray(w.denyRead) && w.denyRead.every((p) => typeof p === "string" && isAbsolute(p)))) {
+    throw new Error(`worker ${id}: denyRead must list absolute paths`);
+  }
   const mcp = w.mcp ?? null;
   if (mcp !== null) {
     if (typeof mcp.config !== "string" || !isAbsolute(mcp.config)) throw new Error(`worker ${id}: mcp.config must be an absolute path`);
@@ -92,6 +96,8 @@ function validateWorker(id, w) {
     mcp,
     timeout: w.timeout ?? "30m",
     resume: w.resume !== false,
+    skillsHome: w.skillsHome === undefined ? null : realDir(w.skillsHome, `worker ${id} skillsHome`),
+    denyRead: w.denyRead ?? [],
   };
 }
 

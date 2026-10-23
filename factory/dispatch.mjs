@@ -3,15 +3,17 @@
 //   node factory/dispatch.mjs --profiles <file> --worker <id> --mode implement|review \
 //        --cd <workspace> --brief <file> --out-dir <dir> [--session <id>]
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadProfiles, resolveWorker, workerEnv } from "./profiles.mjs";
+import { listCodexSkills, skillOverrides } from "./skills.mjs";
+import { claudeUsage, codexUsage, gate } from "./capacity.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const relayPath = (provider) => join(ROOT, "skills", `${provider}-delegate`, "scripts", "relay.mjs");
 
-export function relayArgv(worker, { mode, workspace, brief, outDir, session }) {
+export function relayArgv(worker, { mode, workspace, brief, outDir, session, codexOverrides = [] }) {
   const argv = [relayPath(worker.provider), "--brief", brief, "--cd", workspace, "--out-dir", outDir, "--worker", worker.id, "--timeout", worker.timeout];
   if (worker.model) argv.push("--model", worker.model);
   if (worker.effort) argv.push("--effort", worker.effort);
@@ -22,6 +24,7 @@ export function relayArgv(worker, { mode, workspace, brief, outDir, session }) {
   if (worker.provider === "claude") {
     argv.push("--claude-bin", worker.bin);
     if (worker.profileDir) argv.push("--config-dir", worker.profileDir);
+    for (const path of worker.denyRead) argv.push("--deny-read", path);
     if (mode === "review") argv.push("--read-only");
     else {
       argv.push("--implement");
@@ -34,6 +37,9 @@ export function relayArgv(worker, { mode, workspace, brief, outDir, session }) {
   } else {
     argv.push("--codex-bin", worker.bin, "--ignore-user-config");
     if (worker.profileDir) argv.push("--codex-home", worker.profileDir);
+    if (worker.skillsHome) argv.push("--home", worker.skillsHome);
+    if (mode === "review" && !existsSync(join(workspace, ".git"))) argv.push("--skip-git-repo-check");
+    for (const override of codexOverrides) argv.push("--codex-config", override);
     if (mode === "review") argv.push("--read-only");
     else {
       argv.push("--implement");
@@ -43,12 +49,32 @@ export function relayArgv(worker, { mode, workspace, brief, outDir, session }) {
   return argv;
 }
 
-export function dispatch({ profilesPath, workerId, mode, cd, brief, outDir, session = null, env = process.env }) {
+// Official, inference-free quota read for one worker profile, gated fail-closed.
+export async function capacityFor(profilesPath, workerId) {
+  const worker = loadProfiles(profilesPath).workers[workerId];
+  if (!worker) throw new Error(`unknown worker "${workerId}"`);
+  const snapshot = worker.provider === "claude" ? claudeUsage(worker.bin, worker.profileDir) : await codexUsage(worker.bin, worker.profileDir);
+  return { worker: workerId, snapshot, gate: gate(snapshot) };
+}
+
+export async function codexSkillPolicy(worker, workspace, env = process.env) {
+  if (worker.provider !== "codex" || !worker.skillsHome) return null;
+  const skills = await listCodexSkills({ bin: worker.bin, codexHome: worker.profileDir, home: worker.skillsHome, cwd: workspace, env: workerEnv(env) });
+  return skillOverrides(skills, worker.skillsHome);
+}
+
+export async function dispatch({ profilesPath, workerId, mode, cd, brief, outDir, session = null, env = process.env, onSpawn = null }) {
   const profiles = loadProfiles(profilesPath);
   const { worker, workspace } = resolveWorker(profiles, workerId, mode, cd);
-  const argv = relayArgv(worker, { mode, workspace, brief, outDir, session });
+  const policy = await codexSkillPolicy(worker, workspace, env);
+  if (policy) {
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, "skill-policy.json"), `${JSON.stringify(policy, null, 2)}\n`);
+  }
+  const argv = relayArgv(worker, { mode, workspace, brief, outDir, session, codexOverrides: policy?.overrides ?? [] });
   return new Promise((resolveRun) => {
     const child = spawn(process.execPath, argv, { env: workerEnv(env), stdio: ["ignore", "pipe", "pipe"] });
+    if (onSpawn) onSpawn(child.pid);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -56,7 +82,7 @@ export function dispatch({ profilesPath, workerId, mode, cd, brief, outDir, sess
     child.on("close", (code) => {
       const resultFile = join(outDir, "result.json");
       const result = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, "utf8")) : null;
-      resolveRun({ exitCode: code, result, stdout, stderr, argv });
+      resolveRun({ exitCode: code, result, stdout, stderr, argv, skillPolicy: policy });
     });
   });
 }

@@ -48,7 +48,7 @@ later-edited project config fails closed until it is reviewed and written again 
 | --- | --- | --- | --- |
 | `claude` | claude-delegate | `claude` | model, effort, timeout, readOnly, worker, configDir, claudeBin |
 | `cline` | cline-delegate | `cline` | provider, model, timeout |
-| `codex` | codex-delegate | `codex` | model, effort, sandbox, timeout, readOnly, worker, codexHome, codexBin, ignoreUserConfig |
+| `codex` | codex-delegate | `codex` | model, effort, sandbox, timeout, readOnly, worker, codexHome, codexBin, ignoreUserConfig, home |
 | `commandcode` | commandcode-delegate | `cmd` | model, effort, timeout, readOnly |
 | `opencode` | opencode-delegate | `opencode` | model, **variant**, timeout, readOnly |
 | `agy` | agy-delegate | `agy` | model, effort, timeout, readOnly |
@@ -68,6 +68,8 @@ later-edited project config fails closed until it is reviewed and written again 
 `worker`, `configDir`/`codexHome` and `claudeBin`/`codexBin` are Factory worker-profile dials: a label, the
 official CLI profile directory, and the absolute executable path. Path dials must be absolute. `ignoreUserConfig`
 (boolean, codex) keeps ambient `config.toml` MCP servers out of a run; the lane must then name `model`.
+`home` (absolute, codex) sets the child `HOME`, so user-level skills come from `<home>/.agents/skills`;
+authentication still comes from `CODEX_HOME`.
 
 ZCode carries its `--mode` as `permissionMode`, and only `plan` and `yolo` are accepted: ZCode also
 documents `build` and `edit`, but a headless run has no permission client, so those two block every
