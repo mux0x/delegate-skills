@@ -45,6 +45,8 @@ const ws = join(scratch, "ws");
 const conf = join(scratch, "conf");
 const binDir = join(scratch, "bin");
 for (const dir of [ws, conf, binDir, join(scratch, "profiles", "claude-b"), join(scratch, "profiles", "codex-home"), join(scratch, "plugins", "matt")]) mkdirSync(dir, { recursive: true });
+copyFileSync(join(here, "fixtures", "fake-opencode.cjs"), join(binDir, "opencode"));
+chmodSync(join(binDir, "opencode"), 0o755);
 for (const name of ["claude-a", "claude-b", "codex"]) {
   copyFileSync(join(here, "fixtures", "fake-agent.cjs"), join(binDir, name));
   chmodSync(join(binDir, name), 0o755);
@@ -65,6 +67,7 @@ const profilesDoc = {
     "codex-hanger": { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), model: "gpt-fake", modes: ["implement"], timeout: "3s" },
     hanger: { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement"], pluginDirs: [join(scratch, "plugins", "matt")], timeout: "3s" },
     "codex-skilled": { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), skillsHome: join(scratch, "plugins", "matt"), model: "gpt-fake", modes: ["implement"], timeout: "60s" },
+    oc: { provider: "opencode", bin: join(binDir, "opencode"), model: "opencode-go/glm-5.3", effort: "default", modes: ["implement", "review"], denyRead: [join(scratch, "private")], timeout: "60s" },
     "claude-denyread": { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement", "review"], denyRead: [join(scratch, "private")], timeout: "60s" },
   },
 };
@@ -237,7 +240,7 @@ const groups = {
     expectThrow("profiles file inside the workspace refused", () => loadProfiles(writeProfiles(() => {}, join(ws, "workers.json"))), /outside workspaceRoot/);
     expectThrow("unknown worker refused", () => resolveWorker(loadProfiles(profilesPath), "ghost", "review", repo), /unknown worker/);
     expectThrow("workspace outside root refused", () => resolveWorker(loadProfiles(profilesPath), "claude-a", "review", scratch), /outside workspaceRoot/);
-    expectThrow("skillsHome on a claude worker refused", () => loadProfiles(writeProfiles((d) => { d.workers["claude-a"].skillsHome = conf; })), /codex-only/);
+    expectThrow("skillsHome on a claude worker refused", () => loadProfiles(writeProfiles((d) => { d.workers["claude-a"].skillsHome = conf; })), /does not apply to claude/);
     expectThrow("relative denyRead refused", () => loadProfiles(writeProfiles((d) => { d.workers["claude-a"].denyRead = ["secrets"]; })), /absolute paths/);
     expectThrow("injected worker id refused", () => loadProfiles(writeProfiles((d) => { d.workers["a;rm -rf"] = d.workers["claude-a"]; })), /unsupported characters/);
     const relay = (provider, extra) => spawnSync(process.execPath, [join(ROOT, `skills/${provider}-delegate/scripts/relay.mjs`), "--brief", brief(), "--cd", repo, ...extra], { encoding: "utf8" });
@@ -592,6 +595,49 @@ const groups = {
     check("S overrides use Codex skills.config and disable plugins", policy.overrides[0] === "features.plugins=false" && policy.overrides[1] === `skills.config=[{path=${JSON.stringify(join(scratch, "elsewhere", "other", "SKILL.md"))},enabled=false}]`);
     const argv = relayArgv(loadProfiles(profilesPath).workers["codex-skilled"], { mode: "implement", workspace: ws, brief: "b", outDir: "o", codexOverrides: policy.overrides });
     check("S codex worker gets the Factory HOME and the overrides", pair(argv, "--home", realpathSync(home)) && pair(argv, "--codex-config", "features.plugins=false"));
+  },
+  opencode: async () => {
+    const profiles = loadProfiles(profilesPath);
+    const doc = structuredClone(profilesDoc);
+    doc.workers.oc.codexHome = conf;
+    writeFileSync(join(conf, "oc-variant.json"), JSON.stringify(doc), { mode: 0o600 });
+    let refusedHome = null;
+    try { loadProfiles(join(conf, "oc-variant.json")); } catch (error) { refusedHome = error.message; }
+    check("O opencode worker refuses codexHome", /does not apply/.test(refusedHome ?? ""), refusedHome ?? "did not throw");
+    const review = relayArgv({ ...profiles.workers.oc, effort: "high" }, { mode: "review", workspace: ws, brief: "b", outDir: "o" });
+    check("O review argv: bin, seatbelt, read-only, variant", pair(review, "--opencode-bin", join(binDir, "opencode")) && review.includes("--seatbelt") && review.includes("--read-only") && pair(review, "--variant", "high") && !review.includes("--effort"));
+    const impl = relayArgv(profiles.workers.oc, { mode: "implement", workspace: ws, brief: "b", outDir: "o" });
+    check("O implement argv: --implement, deny-read, no variant for default", impl.includes("--implement") && pair(impl, "--deny-read", join(scratch, "private")) && !impl.includes("--variant"));
+    const repo = join(ws, "oc-repo");
+    mkdirSync(repo, { recursive: true });
+    g(repo, "init", "-q");
+    mkdirSync(join(scratch, "private"), { recursive: true });
+    writeFileSync(join(scratch, "private", "token"), "secret");
+    const outside = join(process.env.HOME, `.factory-contract-probe-${process.pid}`);
+    writeFileSync(join(scratch, "fake-oc.json"), JSON.stringify({ outside, secret: join(scratch, "private", "token") }));
+    const runOc = async (mode, tag = "") => {
+      const outDir = join(scratch, "out", `oc-${mode}${tag}`);
+      const argv = relayArgv(profiles.workers.oc, { mode, workspace: repo, brief: brief(`factory contract brief${tag}`), outDir });
+      spawnSync(process.execPath, argv, { env: { ...process.env, ANTHROPIC_API_KEY: "leak" }, encoding: "utf8" });
+      return existsSync(join(outDir, "result.json")) ? JSON.parse(readFileSync(join(outDir, "result.json"), "utf8")) : null;
+    };
+    const probeOf = (result) => JSON.parse(/done (\{.*\})/s.exec(result?.finalMessage ?? "")?.[1] ?? "{}");
+    if (process.platform === "darwin") {
+      const result = await runOc("implement");
+      const probe = probeOf(result);
+      rmSync(outside, { force: true });
+      check("O implement completes with worker and seatbelt recorded", result?.status === "completed" && result.worker === "oc" && result.mode === "implement" && !!result.seatbelt);
+      check("O seatbelt: workspace writable, .git and HOME not, secret unreadable", probe.ws === "written" && probe.git === "EPERM" && probe.outside === "EPERM" && probe.secret === "EPERM", JSON.stringify({ ...probe, seen: undefined }));
+      const config = JSON.parse(readFileSync(join(probe.seen.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"));
+      check("O child env is minimal and config isolated with git push denied", probe.seen.env.ANTHROPIC_API_KEY === null && config.permission.bash["git push*"] === "deny" && probe.seen.args.includes("--auto"));
+      const ro = await runOc("review");
+      const roProbe = probeOf(ro);
+      check("O review: plan agent, workspace not writable, no --auto", ro?.agent === "plan" && roProbe.ws === "EPERM" && !roProbe.seen.args.includes("--auto"), JSON.stringify({ ...roProbe, seen: undefined }));
+    }
+    const refused = await runOc("review", " FAKE_OC=error402");
+    check("O provider 402 with no report is a failure", refused?.status === "failed" && refused.providerError?.statusCode === 402);
+    const snap = fromRelayResult(refused);
+    check("O provider refusal becomes a cooldown observation", snap?.provider === "opencode" && snap.limitReached === "provider_refused" && snap.measured === false);
   },
 };
 

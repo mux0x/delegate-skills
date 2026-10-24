@@ -16,7 +16,9 @@ export const relayPath = (provider) => join(ROOT, "skills", `${provider}-delegat
 export function relayArgv(worker, { mode, workspace, brief, outDir, session, codexOverrides = [] }) {
   const argv = [relayPath(worker.provider), "--brief", brief, "--cd", workspace, "--out-dir", outDir, "--worker", worker.id, "--timeout", worker.timeout];
   if (worker.model) argv.push("--model", worker.model);
-  if (worker.effort) argv.push("--effort", worker.effort);
+  // OpenCode's reasoning dial is --variant; "default" leaves the model's own default.
+  if (worker.effort && worker.provider === "opencode") { if (worker.effort !== "default") argv.push("--variant", worker.effort); }
+  else if (worker.effort) argv.push("--effort", worker.effort);
   if (session) {
     if (!worker.resume) throw new Error(`worker ${worker.id} does not allow resume`);
     argv.push("--session", session);
@@ -34,6 +36,13 @@ export function relayArgv(worker, { mode, workspace, brief, outDir, session, cod
         for (const tool of worker.mcp.allowTools) argv.push("--allow-mcp-tool", tool);
       }
     }
+  } else if (worker.provider === "opencode") {
+    // No OS sandbox of its own: the relay runs it under sandbox-exec (writes only in the
+    // workspace, never .git; credentials and other profiles unreadable).
+    argv.push("--opencode-bin", worker.bin, "--seatbelt");
+    if (worker.skillsHome) argv.push("--home", worker.skillsHome);
+    for (const path of worker.denyRead) argv.push("--deny-read", path);
+    argv.push(mode === "review" ? "--read-only" : "--implement");
   } else {
     argv.push("--codex-bin", worker.bin, "--ignore-user-config");
     if (worker.profileDir) argv.push("--codex-home", worker.profileDir);

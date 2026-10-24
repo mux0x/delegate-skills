@@ -50,7 +50,7 @@ later-edited project config fails closed until it is reviewed and written again 
 | `cline` | cline-delegate | `cline` | provider, model, timeout |
 | `codex` | codex-delegate | `codex` | model, effort, sandbox, timeout, readOnly, worker, codexHome, codexBin, ignoreUserConfig, home |
 | `commandcode` | commandcode-delegate | `cmd` | model, effort, timeout, readOnly |
-| `opencode` | opencode-delegate | `opencode` | model, **variant**, timeout, readOnly |
+| `opencode` | opencode-delegate | `opencode` | model, **variant**, timeout, readOnly, worker, opencodeBin, home, seatbelt, denyRead |
 | `agy` | agy-delegate | `agy` | model, effort, timeout, readOnly |
 | `grok` | grok-delegate | `grok` | model, effort, sandbox, timeout, readOnly |
 | `kimi` | kimi-delegate | `kimi` | model, timeout |

@@ -48,7 +48,7 @@ Factory context (set by the Factory, not negotiable):
 `;
 
 export function implementBrief(ticket, state, provider) {
-  const invoke = provider === "claude" ? "/mattpocock-skills:implement" : "$implement";
+  const invoke = provider === "claude" ? "/mattpocock-skills:implement" : provider === "opencode" ? "Load the `implement` skill with your skill tool, then follow it for" : "$implement";
   return `${invoke} ${ticket.issue}\n${factoryContext(ticket, state)}`;
 }
 

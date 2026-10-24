@@ -94,6 +94,8 @@ export function codexWindows(limits) {
   return { windows, limitReached: limits?.rateLimitReachedType ?? limits?.rate_limit_reached_type ?? null, plan: limits?.planType ?? limits?.plan_type ?? null };
 }
 
+const PROVIDER_LIMIT = /\b(402|429)\b|rate[ _-]?limit|too many requests|usage limit|limit reached|insufficient (balance|credit|quota)|quota/i;
+
 // Passive telemetry carried by every relay result: no extra call at all.
 export function fromRelayResult(result) {
   if (result?.rateLimit?.unifiedWindows) {
@@ -102,6 +104,10 @@ export function fromRelayResult(result) {
       windows[name] = { usedPercent: Math.round(slot.utilization * 1000) / 10, resetsAt: new Date(slot.resetsAt * 1000).toISOString() };
     }
     return { provider: "claude", source: "relay rate_limit_event", measured: true, inference: false, observedAt: result.finishedAt, windows, limitReached: result.rateLimit.status === "allowed" ? null : result.rateLimit.status };
+  }
+  // OpenCode has no quota interface; a provider refusal is the only signal, and it is a cooldown.
+  if (result?.tool === "opencode" && result.providerError && PROVIDER_LIMIT.test(`${result.providerError.statusCode ?? ""} ${result.providerError.message}`)) {
+    return { provider: "opencode", source: "relay provider error", measured: false, inference: false, observedAt: result.finishedAt, windows: {}, limitReached: "provider_refused", error: result.providerError.message };
   }
   if (result?.rateLimits) {
     return { provider: "codex", source: "relay rollout token_count", measured: true, inference: false, observedAt: result.finishedAt, ...codexWindows(result.rateLimits) };

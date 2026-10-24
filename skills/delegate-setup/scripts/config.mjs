@@ -150,10 +150,14 @@ function validateLane(name, lane, label) {
     if (!impl.supports.includes(field)) {
       return `${label}: lane ${name}: ${impl.key} does not support ${field} (supports: ${impl.supports.join(", ") || "none"})`;
     }
-    if (field === "readOnly" || field === "force" || field === "ignoreUserConfig") {
+    if (field === "readOnly" || field === "force" || field === "ignoreUserConfig" || field === "seatbelt") {
       if (typeof lane[field] !== "boolean") {
         return `${label}: lane ${name}.${field} must be a boolean`;
       }
+      continue;
+    }
+    if (field === "denyRead") {
+      if (!Array.isArray(lane[field]) || !lane[field].every((p) => typeof p === "string" && isAbsolute(p))) return `${label}: lane ${name}.denyRead must list absolute paths`;
       continue;
     }
     if (typeof lane[field] !== "string" || lane[field].length === 0) {

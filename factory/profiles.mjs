@@ -9,6 +9,8 @@ const SAFE_MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
 const PROVIDERS = {
   claude: { profileDir: "configDir", envVar: "CLAUDE_CONFIG_DIR" },
   codex: { profileDir: "codexHome", envVar: "CODEX_HOME" },
+  // OpenCode keeps its login in the real HOME's data dir; it has no per-profile directory.
+  opencode: { profileDir: null, envVar: null },
 };
 const MODES = new Set(["implement", "review"]);
 const WORKER_KEYS = new Set(["provider", "bin", "configDir", "codexHome", "model", "effort", "modes", "pluginDirs", "mcp", "timeout", "resume", "skillsHome", "denyRead"]);
@@ -68,12 +70,14 @@ function validateWorker(id, w) {
   if (unknown.length) throw new Error(`worker ${id}: unknown field(s) ${unknown.join(", ")}`);
   const provider = PROVIDERS[w.provider];
   if (!provider) throw new Error(`worker ${id}: provider must be one of ${Object.keys(PROVIDERS).join(", ")}`);
-  const other = w.provider === "claude" ? "codexHome" : "configDir";
-  if (w[other] !== undefined) throw new Error(`worker ${id}: ${other} does not apply to ${w.provider}`);
+  for (const other of ["configDir", "codexHome"].filter((key) => key !== provider.profileDir)) {
+    if (w[other] !== undefined) throw new Error(`worker ${id}: ${other} does not apply to ${w.provider}`);
+  }
   const modes = w.modes ?? ["review"];
   if (!Array.isArray(modes) || !modes.every((mode) => MODES.has(mode))) throw new Error(`worker ${id}: modes must be implement/review`);
   if (w.pluginDirs !== undefined && w.provider !== "claude") throw new Error(`worker ${id}: pluginDirs is claude-only`);
-  if (w.skillsHome !== undefined && w.provider !== "codex") throw new Error(`worker ${id}: skillsHome is codex-only`);
+  if (w.skillsHome !== undefined && w.provider === "claude") throw new Error(`worker ${id}: skillsHome does not apply to claude`);
+  if (w.provider === "opencode" && w.mcp !== undefined) throw new Error(`worker ${id}: mcp is not supported for opencode`);
   if (w.denyRead !== undefined && !(Array.isArray(w.denyRead) && w.denyRead.every((p) => typeof p === "string" && isAbsolute(p)))) {
     throw new Error(`worker ${id}: denyRead must list absolute paths`);
   }
@@ -88,7 +92,7 @@ function validateWorker(id, w) {
     id,
     provider: w.provider,
     bin: executable(w.bin, `worker ${id} bin`),
-    profileDir: w[provider.profileDir] === undefined ? null : realDir(w[provider.profileDir], `worker ${id} ${provider.profileDir}`),
+    profileDir: !provider.profileDir || w[provider.profileDir] === undefined ? null : realDir(w[provider.profileDir], `worker ${id} ${provider.profileDir}`),
     model: w.model ?? null,
     effort: w.effort ?? null,
     modes,

@@ -148,7 +148,7 @@ export const IMPLEMENTERS = Object.freeze([
     // database would mean opening conversation content.
     usageProbe: null,
     // OpenCode reasoning intensity is --variant, not --effort.
-    supports: ["model", "variant", "timeout", "readOnly"],
+    supports: ["model", "variant", "timeout", "readOnly", "worker", "opencodeBin", "home", "seatbelt", "denyRead"],
     winShell: true,
   },
   {
@@ -474,6 +474,9 @@ export const ALL_DIALS = Object.freeze([
   "codexBin",
   "ignoreUserConfig",
   "home",
+  "opencodeBin",
+  "seatbelt",
+  "denyRead",
 ]);
 // Factory worker-profile dials: absolute paths to an official CLI and its profile directory.
-export const PATH_DIALS = Object.freeze(["configDir", "claudeBin", "codexHome", "codexBin", "home"]);
+export const PATH_DIALS = Object.freeze(["configDir", "claudeBin", "codexHome", "codexBin", "home", "opencodeBin"]);

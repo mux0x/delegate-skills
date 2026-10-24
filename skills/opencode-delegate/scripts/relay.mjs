@@ -52,6 +52,20 @@
  *                           killed and result.json gets status "timeout".
  *   --out-dir <dir>         Where to write run artifacts (default: a fresh dir under
  *                           the system temp dir, so the repo under review stays clean).
+ *
+ * Factory options (opt-in; a run that passes none is unchanged):
+ *   --worker <id>           Worker-profile label recorded in result.json. Also gives the child a
+ *                           minimal environment and an isolated config dir (no user plugins)
+ *                           whose permission rules deny git commit/push and gh.
+ *   --opencode-bin <abs>    The opencode executable (default: opencode on PATH).
+ *   --implement             Write-capable build agent with --auto.
+ *   --home <abs dir>        Child HOME, so user-level skills come from <dir>/.agents/skills.
+ *                           Authentication and opencode state stay under the real HOME.
+ *   --deny-read <abs path>  Deny reads of this path (repeatable; needs --seatbelt).
+ *   --seatbelt              macOS only: run opencode under sandbox-exec. Writes are allowed only
+ *                           in --cd (never its .git or git common dir; nowhere in --cd with
+ *                           --read-only), temp dirs and opencode's own state; the keychain is
+ *                           unreachable.
  *   -h, --help              Show this help.
  *
  * Result: written to <out-dir>/result.json and summarized on stdout —
@@ -72,8 +86,8 @@
  */
 
 import {spawn, execSync, execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync, appendFileSync } from "node:fs";
-import {join, resolve, basename, dirname } from "node:path";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync, appendFileSync, realpathSync } from "node:fs";
+import {join, resolve, basename, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { constants, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
@@ -211,6 +225,12 @@ function parseArgs(argv) {
     pure: false,
     timeout: null,
     outDir: null,
+    worker: null,
+    opencodeBin: null,
+    implement: false,
+    home: null,
+    denyRead: [],
+    seatbelt: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -240,6 +260,12 @@ function parseArgs(argv) {
       case "--pure": opts.pure = true; break;
       case "--timeout": opts.timeout = next(); flagged.add("timeout"); break;
       case "--out-dir": opts.outDir = resolve(next()); break;
+      case "--worker": opts.worker = next(); break;
+      case "--opencode-bin": opts.opencodeBin = next(); break;
+      case "--implement": opts.implement = true; opts.agent = "build"; opts.auto = true; flagged.add("agent"); break;
+      case "--home": opts.home = next(); break;
+      case "--deny-read": opts.denyRead.push(next()); break;
+      case "--seatbelt": opts.seatbelt = true; break;
       default:
         fail(`unknown option: ${arg}`);
     }
@@ -259,7 +285,77 @@ function parseArgs(argv) {
   if (opts.timeout !== null && parseDuration(opts.timeout) === null) {
     fail(`--timeout "${opts.timeout}" is invalid or too long; use a positive h/m/s duration no longer than about 24 days`);
   }
+  validateFactoryOptions(opts, flagged);
   return opts;
+}
+
+function validateFactoryOptions(opts, flagged) {
+  if (opts.worker !== null && !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(opts.worker)) fail("--worker contains unsupported characters (allowed: letters, digits, . _ : -)");
+  if (opts.opencodeBin !== null && !isAbsolute(opts.opencodeBin)) fail("--opencode-bin must be an absolute path");
+  if (opts.implement && flagged.has("readOnly")) fail("--implement and --read-only are mutually exclusive");
+  if (opts.home !== null && !(isAbsolute(opts.home) && existsSync(opts.home))) fail("--home must be an existing absolute directory");
+  for (const path of opts.denyRead) if (!isAbsolute(path)) fail("--deny-read must be an absolute path");
+  if (opts.denyRead.length && !opts.seatbelt) fail("--deny-read needs --seatbelt");
+  if (opts.seatbelt && process.platform !== "darwin") fail("--seatbelt is macOS-only (sandbox-exec)");
+}
+
+// Seatbelt rules are matched against real paths (/var is /private/var on macOS).
+const realOr = (path) => { try { return realpathSync(path); } catch { return path; } };
+const sbString = (path) => JSON.stringify(realOr(path));
+
+function gitDirs(cwd) {
+  const dirs = [join(cwd, ".git")];
+  for (const flag of ["--git-dir", "--git-common-dir"]) {
+    try {
+      const out = execFileSync("git", ["rev-parse", "--path-format=absolute", flag], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }).trim();
+      if (out) dirs.push(out);
+    } catch { /* not a git checkout */ }
+  }
+  return [...new Set(dirs)];
+}
+
+function seatbeltProfile(opts, realHome) {
+  const writable = [tmpdir(), "/private/tmp", "/private/var/folders", ...["share", "cache", "state"].map((d) => xdgDir(realHome, d))];
+  const lines = [
+    "(version 1)",
+    "(allow default)",
+    "(deny file-write*)",
+    `(allow file-write* ${writable.map((p) => `(subpath ${sbString(p)})`).join(" ")} (subpath "/dev"))`,
+  ];
+  // Later rules win: a review denies its whole tree even when it sits in a temp dir.
+  lines.push(opts.implement ? `(allow file-write* (subpath ${sbString(opts.cd)}))` : `(deny file-write* (subpath ${sbString(opts.cd)}))`);
+  lines.push(`(deny file-write* ${gitDirs(opts.cd).map((p) => `(subpath ${sbString(p)})`).join(" ")})`);
+  if (opts.denyRead.length) lines.push(`(deny file-read* ${opts.denyRead.map((p) => `(subpath ${sbString(p)})`).join(" ")})`);
+  lines.push('(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc"))');
+  return `${lines.join("\n")}\n`;
+}
+
+function xdgDir(home, kind) {
+  return kind === "share" ? join(home, ".local", "share", "opencode") : kind === "cache" ? join(home, ".cache", "opencode") : join(home, ".local", "state", "opencode");
+}
+
+// Factory child environment: minimal, real opencode state, isolated config with hard denials.
+function factoryEnv(opts, outDir) {
+  const realHome = process.env.HOME || "";
+  const env = {};
+  for (const key of ["PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR"]) if (process.env[key] !== undefined) env[key] = process.env[key];
+  env.HOME = opts.home ?? realHome;
+  env.XDG_DATA_HOME = process.env.XDG_DATA_HOME ?? join(realHome, ".local", "share");
+  env.XDG_CACHE_HOME = process.env.XDG_CACHE_HOME ?? join(realHome, ".cache");
+  env.XDG_STATE_HOME = process.env.XDG_STATE_HOME ?? join(realHome, ".local", "state");
+  env.XDG_CONFIG_HOME = join(outDir, "opencode-config");
+  mkdirSync(join(env.XDG_CONFIG_HOME, "opencode"), { recursive: true });
+  const deny = Object.fromEntries(["git commit*", "git push*", "git config*", "git remote*", "git update-ref*", "git tag*", "gh *", "git credential*"].map((p) => [p, "deny"]));
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    autoupdate: false,
+    share: "disabled",
+    ...(opts.model ? { small_model: opts.model.split("#")[0] } : {}),
+    permission: { bash: { "*": "allow", ...deny }, ...(opts.implement ? {} : { edit: "deny" }), webfetch: "deny" },
+  };
+  writeFileSync(join(env.XDG_CONFIG_HOME, "opencode", "opencode.json"), `${JSON.stringify(config, null, 2)}\n`);
+  if (opts.seatbelt) writeFileSync(join(outDir, "seatbelt.sb"), seatbeltProfile(opts, realHome));
+  return env;
 }
 
 function parseDuration(duration) {
@@ -336,7 +432,7 @@ function versionProbeTimeout(opts) {
   return timeoutMs === null ? VERSION_PROBE_TIMEOUT_MS : Math.min(timeoutMs, VERSION_PROBE_TIMEOUT_MS);
 }
 
-function opencodeVersion(probeTimeoutMs) {
+function opencodeVersion(probeTimeoutMs, bin = "opencode") {
   try {
     // On Windows, npm installs `opencode` as a .cmd shim; Node's CreateProcess only
     // auto-appends .exe, never .cmd, so launching it needs shell:true there or it
@@ -350,7 +446,7 @@ function opencodeVersion(probeTimeoutMs) {
     };
     const version = (process.platform === "win32"
       ? execSync("opencode --version", options)
-      : execFileSync("opencode", ["--version"], options)).trim();
+      : execFileSync(bin, ["--version"], options)).trim();
     return { version: version || "unknown", error: null };
   } catch (error) {
     if (error?.code === "ENOENT") return { version: null, error: null };
@@ -470,6 +566,9 @@ function makeResultWriter(opts, version, run) {
       briefPath: run.briefPath,
       eventsPath: run.eventsPath,
       finalPath: existsSync(run.finalPath) ? run.finalPath : null,
+      ...(opts.worker === null ? {} : { worker: opts.worker, mode: opts.implement ? "implement" : opts.agent === "plan" ? "review" : opts.agent }),
+      ...(opts.seatbelt ? { seatbelt: join(dirname(run.resultPath), "seatbelt.sb") } : {}),
+      ...(opts.denyRead.length ? { denyRead: opts.denyRead } : {}),
       ...extra,
     };
     // Publish atomically so a polling orchestrator never reads a half-written file
@@ -529,14 +628,19 @@ function dispatchToOpenCode(opts, brief, run, writeResult, version) {
   // Safe: the brief is fed via child.stdin below — never argv — and argv holds only
   // flag names, an agent enum, a model string, and a session id, with no shell
   // metacharacters or spaceable paths.
-  const child = spawnShellLaunch("opencode", argv, {
+  const factory = opts.worker !== null;
+  const childEnv = factory ? factoryEnv(opts, dirname(run.resultPath)) : process.env;
+  const bin = opts.opencodeBin ?? "opencode";
+  const [launch, launchArgv] = opts.seatbelt ? ["/usr/bin/sandbox-exec", ["-f", join(dirname(run.resultPath), "seatbelt.sb"), bin, ...argv]] : [bin, argv];
+  const child = spawnShellLaunch(launch, launchArgv, {
     cwd: opts.cd,
-    env: { ...process.env, PWD: opts.cd },
+    env: { ...childEnv, PWD: opts.cd },
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32", // POSIX: lead a new process group so killChild can fell the whole tree
   }, process.platform === "win32");
 
   let sessionId = opts.session || null;
+  let providerError = null;
   let totalCost = 0;
   let sawCost = false;
   const textParts = new Map(); // part.id -> latest text
@@ -555,6 +659,10 @@ function dispatchToOpenCode(opts, brief, run, writeResult, version) {
       const id = event.part.id || `anon-${textOrder.length}`;
       if (!textParts.has(id)) textOrder.push(id);
       textParts.set(id, event.part.text ?? "");
+    }
+    if (event.type === "error" && event.error) {
+      const data = event.error.data ?? {};
+      providerError = { name: event.error.name ?? null, message: String(data.message ?? event.error.message ?? "").slice(0, 2000), statusCode: data.statusCode ?? null };
     }
     if (event.type === "step_finish" && event.part && typeof event.part.cost === "number") {
       totalCost += event.part.cost;
@@ -679,8 +787,9 @@ function dispatchToOpenCode(opts, brief, run, writeResult, version) {
     if (watchdogFired) killChild(child, "SIGKILL");
     const finalMessage = assembleFinal();
     // A timed-out run is never a success even if opencode handles SIGTERM by exiting 0 -
-    // orchestrators key off status and the relay exit code.
-    const succeeded = code === 0 && !watchdogFired;
+    // orchestrators key off status and the relay exit code. A Factory run that ended on a
+    // provider error (402, 429, unknown model) with no report is not a success either.
+    const succeeded = code === 0 && !watchdogFired && !(factory && providerError && !finalMessage);
     const mapped = code ?? (constants.signals[signal] ? 128 + constants.signals[signal] : 1);
     const result = writeResult({
       status: succeeded ? "completed" : watchdogFired ? "timeout" : "failed",
@@ -692,6 +801,7 @@ function dispatchToOpenCode(opts, brief, run, writeResult, version) {
       cost: sawCost ? Number(totalCost.toFixed(6)) : null,
       ...(succeeded ? {} : { stderrTail: stderrTail.slice(-20) }),
       ...(watchdogFired ? { error: `opencode did not finish within --timeout ${opts.timeout}; killed by the relay watchdog` } : {}),
+      ...(factory && providerError ? { providerError, ...(succeeded || watchdogFired ? {} : { error: `provider error${providerError.statusCode ? ` ${providerError.statusCode}` : ""}: ${providerError.message}` }) } : {}),
     });
     printSummary(result, run.resultPath);
     process.exit(result.exitCode);
@@ -723,7 +833,7 @@ function main() {
   // somewhere to publish result.json rather than exiting silently.
   const run = prepareRunDir(opts, brief);
   const probeTimeoutMs = versionProbeTimeout(opts);
-  const probe = opencodeVersion(probeTimeoutMs);
+  const probe = opencodeVersion(probeTimeoutMs, opts.opencodeBin ?? "opencode");
   const writeResult = makeResultWriter(opts, probe.version, run);
 
   if (!probe.version && !probe.error) {
