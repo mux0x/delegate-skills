@@ -86,7 +86,7 @@
  */
 
 import {spawn, execSync, execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync, appendFileSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, renameSync, readFileSync, existsSync, appendFileSync, realpathSync } from "node:fs";
 import {join, resolve, basename, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { constants, tmpdir } from "node:os";
@@ -343,7 +343,8 @@ function factoryEnv(opts, outDir) {
   env.XDG_DATA_HOME = process.env.XDG_DATA_HOME ?? join(realHome, ".local", "share");
   env.XDG_CACHE_HOME = process.env.XDG_CACHE_HOME ?? join(realHome, ".cache");
   env.XDG_STATE_HOME = process.env.XDG_STATE_HOME ?? join(realHome, ".local", "state");
-  env.XDG_CONFIG_HOME = join(outDir, "opencode-config");
+  // In a temp dir, not the out-dir: the Factory's out-dirs live under paths the seatbelt denies.
+  env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "opencode-factory-config-"));
   mkdirSync(join(env.XDG_CONFIG_HOME, "opencode"), { recursive: true });
   const deny = Object.fromEntries(["git commit*", "git push*", "git config*", "git remote*", "git update-ref*", "git tag*", "gh *", "git credential*"].map((p) => [p, "deny"]));
   const config = {

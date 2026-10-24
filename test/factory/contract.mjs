@@ -67,7 +67,7 @@ const profilesDoc = {
     "codex-hanger": { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), model: "gpt-fake", modes: ["implement"], timeout: "3s" },
     hanger: { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement"], pluginDirs: [join(scratch, "plugins", "matt")], timeout: "3s" },
     "codex-skilled": { provider: "codex", bin: join(binDir, "codex"), codexHome: join(scratch, "profiles", "codex-home"), skillsHome: join(scratch, "plugins", "matt"), model: "gpt-fake", modes: ["implement"], timeout: "60s" },
-    oc: { provider: "opencode", bin: join(binDir, "opencode"), model: "opencode-go/glm-5.3", effort: "default", modes: ["implement", "review"], denyRead: [join(scratch, "private")], timeout: "60s" },
+    oc: { provider: "opencode", bin: join(binDir, "opencode"), model: "opencode-go/glm-5.3", effort: "default", modes: ["implement", "review"], denyRead: [join(scratch, "private"), join(scratch, "out")], timeout: "60s" },
     "claude-denyread": { provider: "claude", bin: join(binDir, "claude-a"), modes: ["implement", "review"], denyRead: [join(scratch, "private")], timeout: "60s" },
   },
 };
