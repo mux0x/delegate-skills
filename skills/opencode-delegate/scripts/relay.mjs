@@ -314,8 +314,8 @@ function gitDirs(cwd) {
   return [...new Set(dirs)];
 }
 
-function seatbeltProfile(opts, realHome) {
-  const writable = [tmpdir(), "/private/tmp", "/private/var/folders", ...["share", "cache", "state"].map((d) => xdgDir(realHome, d))];
+function seatbeltProfile(opts, realHome, configHome) {
+  const writable = [tmpdir(), "/private/tmp", "/private/var/folders", configHome, ...["share", "cache", "state"].map((d) => xdgDir(realHome, d))];
   const lines = [
     "(version 1)",
     "(allow default)",
@@ -354,7 +354,7 @@ function factoryEnv(opts, outDir) {
     permission: { bash: { "*": "allow", ...deny }, ...(opts.implement ? {} : { edit: "deny" }), webfetch: "deny" },
   };
   writeFileSync(join(env.XDG_CONFIG_HOME, "opencode", "opencode.json"), `${JSON.stringify(config, null, 2)}\n`);
-  if (opts.seatbelt) writeFileSync(join(outDir, "seatbelt.sb"), seatbeltProfile(opts, realHome));
+  if (opts.seatbelt) writeFileSync(join(outDir, "seatbelt.sb"), seatbeltProfile(opts, realHome, env.XDG_CONFIG_HOME));
   return env;
 }
 
